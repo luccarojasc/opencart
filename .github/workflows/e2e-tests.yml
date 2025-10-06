@@ -9,7 +9,21 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     env:
+      # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
+
+      # OpenCart auto-install knobs (used by the php service in docker-compose)
+      OPENCART_USERNAME: admin
+      OPENCART_PASSWORD: admin123
+      OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
+      OPENCART_HTTP_SERVER: http://localhost/   # compose uses this to set store URL
+      DB_DRIVER: mysqli
+      DB_HOSTNAME: mysql
+      DB_USERNAME: opencart
+      DB_PASSWORD: opencart
+      DB_DATABASE: opencart
+      DB_PORT: "3306"
+      DB_PREFIX: oc_
 
     steps:
       - name: Checkout repo
@@ -23,73 +37,63 @@ jobs:
       - name: Detect services and URL
         shell: bash
         run: |
-          set -e
-          # Defaults based on the OpenCart repo compose
-          WEB_SVC=apache
-          PHP_SVC=php
-          DB_SVC=mysql
-
-          # Verify / autodetect if names differ
-          if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
-            PHP_SVC=""
-            for s in $(docker compose ps --services); do
-              if docker compose exec -T "$s" sh -lc 'command -v php >/dev/null 2>&1' 2>/dev/null; then
-                PHP_SVC="$s"; break
-              fi
-            done
-          fi
+          set -euo pipefail
+          # Choose the web service (commonly 'apache')
+          WEB_SVC="apache"
           if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
-            WEB_SVC=$(docker compose ps --services | head -n1)
-          fi
-          if ! docker compose ps --services | grep -qx "$DB_SVC"; then
-            for s in $(docker compose ps --services); do
-              if docker compose exec -T "$s" sh -lc 'test -d /var/lib/mysql || test -d /bitnami/mariadb' >/dev/null 2>&1; then
-                DB_SVC="$s"; break
-              fi
-            done
+            WEB_SVC="$(docker compose ps --services | head -n1)"
           fi
 
-          if [ -z "$PHP_SVC" ]; then echo "::error::No container with PHP CLI found"; exit 1; fi
-          echo "WEB_SVC=$WEB_SVC"   >> "$GITHUB_ENV"
-          echo "PHP_SVC=$PHP_SVC"   >> "$GITHUB_ENV"
-          echo "DB_SVC=$DB_SVC"     >> "$GITHUB_ENV"
-
-          # Locate installer inside PHP container
-          INSTALLER=""
-          for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
-            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
-          done
-          if [ -z "$INSTALLER" ]; then
-            echo "::error::Could not find upload/install/cli_install.php in $PHP_SVC"
-            exit 1
-          fi
-          echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
-
-          # Derive published HTTP port (80 or 8080 commonly)
-          PORT=$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1)
+          # Derive published HTTP port (80 or 8080)
+          PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ]; then
-            PORT=$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1)
+            PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           fi
           if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
             echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           else
             echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
+          echo "Resolved LOCAL_BASE_URL=$(cat $GITHUB_ENV | grep LOCAL_BASE_URL | cut -d= -f2-)"
 
-      - name: Install OpenCart via CLI
+      - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
           set -e
+          # Allow auto-install in php container to finish; poll front page
+          for i in {1..90}; do
+            if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
+              echo "OpenCart is up at $LOCAL_BASE_URL"
+              exit 0
+            fi
+            echo "Waiting for OpenCart... ($i/90)"
+            sleep 3
+          done
+          echo "::group::Recent container logs"
+          docker compose logs --no-color --tail=200
+          echo "::endgroup::"
+          exit 1
 
-          # Pull DB creds from DB container env (handles MYSQL_* or MARIADB_*)
-          DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)
+      - name: Verify HTTP headers (sanity)
+        run: curl -LI "$LOCAL_BASE_URL" || true
 
-          val() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2-; }
-          DB_HOST="$DB_SVC"; DB_PORT=3306; DB_NAME=opencart; DB_USER=root; DB_PASS=root
+      - name: Setup Node.js (for testRigor CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-          DB_NAME_FROM_ENV=$(val MYSQL_DATABASE);  [ -z "$DB_NAME_FROM_ENV" ]  && DB_NAME_FROM_ENV=$(val MARIADB_DATABASE)
-          DB_USER_FROM_ENV=$(val MYSQL_USER);      [ -z "$DB_USER_FROM_ENV" ]  && DB_USER_FROM_ENV=$(val MARIADB_USER)
-          DB_PASS_FROM_ENV=$(val MYSQL_PASSWORD);  [ -z "$DB_PASS_FROM_ENV" ]  && DB_PASS_FROM_ENV=$(val MARIADB_PASSWORD)
-          ROOT_FROM_ENV=$(val MYSQL_ROOT_PASSWORD);[ -z "$ROOT_FROM_ENV" ]     && ROOT_FROM_ENV=$(val MARIADB_ROOT_PASSWORD)
+      - name: Install testRigor CLI
+        run: |
+          npm i -g testrigor-cli
+          testrigor --version || true
 
-          [ -n "$DB_NAME_FROM_ENV" ] && DB_NAME="$DB_NAME_FROM_ENV"
+      - name: Trigger testRigor suite against localhost
+        env:
+          TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
+        run: |
+          echo "Suite ID: $TESTRIGOR_SUITE_ID"
+          echo "URL:      $LOCAL_BASE_URL"
+          npx -y testrigor-cli test-suite run "$TESTRIGOR_SUITE_ID" \
+            --token "$TESTRIGOR_CI_TOKEN" \
+            --localhost --url "$LOCAL_BASE_URL" \
+            --verbose
