@@ -14,6 +14,65 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+          # Install OpenCart non-interactively (creates config files + seeds DB)
+      - name: Install OpenCart (CLI)
+        shell: bash
+        run: |
+          set -e
+
+          echo "Services:"
+          docker compose ps --services
+
+          # Find the web/PHP service that has the installer file
+          WEB_SVC=""
+          for s in $(docker compose ps --services); do
+            if docker compose exec -T "$s" sh -lc 'test -f /var/www/upload/install/cli_install.php' 2>/dev/null; then
+              WEB_SVC="$s"; break
+            fi
+            if docker compose exec -T "$s" sh -lc 'test -f /var/www/html/upload/install/cli_install.php' 2>/dev/null; then
+              WEB_SVC="$s"; break
+            fi
+          done
+          if [ -z "$WEB_SVC" ]; then
+            echo "Could not find service with /var/www/*/upload/install/cli_install.php"; docker compose ps; exit 1
+          fi
+          echo "Using web service: $WEB_SVC"
+
+          # Guess DB service/creds used by the repo compose (adjust if yours differ)
+          DB_HOST="db"
+          DB_NAME="opencart"
+          DB_USER="root"
+          DB_PASS="root"
+          DB_PORT="3306"
+
+          # Path may be /var/www/upload or /var/www/html/upload depending on image
+          PHP="php"
+          INSTALLER="/var/www/upload/install/cli_install.php"
+          docker compose exec -T "$WEB_SVC" sh -lc "test -f $INSTALLER || INSTALLER=/var/www/html/upload/install/cli_install.php; $PHP \$INSTALLER install \
+            --db_hostname $DB_HOST \
+            --db_username $DB_USER \
+            --db_password $DB_PASS \
+            --db_database $DB_NAME \
+            --db_driver mysqli \
+            --db_port $DB_PORT \
+            --username admin \
+            --password admin123 \
+            --email admin@example.com \
+            --http_server ${LOCAL_BASE_URL%/}/"
+
+      # Now wait for the *configured* store to come up cleanly
+      - name: Wait for OpenCart to be reachable
+        shell: bash
+        run: |
+          for i in {1..60}; do
+            if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
+              echo "OpenCart is up at $LOCAL_BASE_URL"; exit 0
+            fi
+            echo "Waiting for OpenCart... ($i/60)"; sleep 5
+          done
+          echo "OpenCart failed to start in time" >&2; exit 1
+
+
       # Start OpenCart using the repo's docker-compose
       - name: Start OpenCart (docker-compose)
         run: |
