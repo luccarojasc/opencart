@@ -77,26 +77,56 @@ jobs:
             echo "LOCAL_BASE_URL=http://localhost:$HOST_PORT" >> "$GITHUB_ENV"
           fi
 
-      - name: Install OpenCart (CLI)
+           - name: Install OpenCart (CLI)
         shell: bash
         run: |
           set -euo pipefail
-          echo "Using WEB_SVC=$WEB_SVC, DB_SVC=$DB_SVC, INSTALLER=$INSTALLER"
+          echo "Using WEB_SVC=$WEB_SVC, DB_SVC=$DB_SVC"
           echo "LOCAL_BASE_URL=$LOCAL_BASE_URL"
 
-          # Read DB env values from the DB container if present
+          # 1) Find the service that actually has a PHP CLI
+          PHP_SVC=""
+          for s in $(docker compose ps --services); do
+            if docker compose exec -T "$s" sh -lc 'command -v php >/dev/null 2>&1' 2>/dev/null; then
+              PHP_SVC="$s"; break
+            fi
+          done
+          if [ -z "$PHP_SVC" ]; then
+            echo "::error::No container with a PHP CLI found. Your compose likely splits apache and php/php-fpm."
+            docker compose ps
+            exit 1
+          fi
+          echo "PHP_SVC=$PHP_SVC"
+
+          # 2) Find cli_install.php path *inside the PHP container*
+          INSTALLER_IN_PHP=""
+          for p in /var/www/upload/install/cli_install.php \
+                   /var/www/html/upload/install/cli_install.php \
+                   /var/www/www/upload/install/cli_install.php; do
+            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then
+              INSTALLER_IN_PHP="$p"; break
+            fi
+          done
+          if [ -z "${INSTALLER_IN_PHP:-}" ]; then
+            echo "::group::Searching for installer"
+            docker compose exec -T "$PHP_SVC" sh -lc 'find /var/www -maxdepth 4 -name cli_install.php || true'
+            echo "::endgroup::"
+            echo "::error::Could not find upload/install/cli_install.php inside $PHP_SVC"
+            exit 1
+          fi
+          echo "INSTALLER_IN_PHP=$INSTALLER_IN_PHP"
+
+          # 3) Read DB envs from the DB container (MYSQL_* or MARIADB_*)
           DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env | egrep "MYSQL_|MARIADB_"' || true)
-          echo "DB env from container:"
+          echo "DB env from $DB_SVC:"
           echo "$DB_ENV"
 
-          # Defaults (override if envs exist)
           DB_HOST="$DB_SVC"
           DB_PORT="3306"
           DB_NAME="opencart"
           DB_USER="root"
           DB_PASS="root"
 
-          # Prefer MYSQL_* then MARIADB_* if found
           DB_NAME_FROM_ENV=$(echo "$DB_ENV" | egrep -m1 '^MYSQL_DATABASE='  | cut -d= -f2- || true)
           DB_USER_FROM_ENV=$(echo "$DB_ENV" | egrep -m1 '^MYSQL_USER='      | cut -d= -f2- || true)
           DB_PASS_FROM_ENV=$(echo "$DB_ENV" | egrep -m1 '^MYSQL_PASSWORD='  | cut -d= -f2- || true)
@@ -113,12 +143,20 @@ jobs:
           fi
           ROOT_MARIA_FROM_ENV=$(echo "$DB_ENV" | egrep -m1 '^MARIADB_ROOT_PASSWORD=' | cut -d= -f2- || true)
 
-          if [ -n "$DB_NAME_FROM_ENV" ]; then DB_NAME="$DB_NAME_FROM_ENV"; fi
-          if [ -n "$DB_USER_FROM_ENV" ]; then DB_USER="$DB_USER_FROM_ENV"; fi
-          if [ -n "$DB_PASS_FROM_ENV" ]; then DB_PASS="$DB_PASS_FROM_ENV"; elif [ -n "$ROOT_FROM_ENV" ]; then DB_USER="root"; DB_PASS="$ROOT_FROM_ENV"; elif [ -n "$ROOT_MARIA_FROM_ENV" ]; then DB_USER="root"; DB_PASS="$ROOT_MARIA_FROM_ENV"; fi
+          [ -n "$DB_NAME_FROM_ENV" ] && DB_NAME="$DB_NAME_FROM_ENV"
+          if [ -n "$DB_USER_FROM_ENV" ]; then
+            DB_USER="$DB_USER_FROM_ENV"
+            [ -n "$DB_PASS_FROM_ENV" ] && DB_PASS="$DB_PASS_FROM_ENV"
+          elif [ -n "$ROOT_FROM_ENV" ]; then
+            DB_USER="root"; DB_PASS="$ROOT_FROM_ENV"
+          elif [ -n "$ROOT_MARIA_FROM_ENV" ]; then
+            DB_USER="root"; DB_PASS="$ROOT_MARIA_FROM_ENV"
+          fi
 
-          # Some images use /var/www/html; the path was detected earlier
-          docker compose exec -T "$WEB_SVC" sh -lc "php '$INSTALLER' install \
+          echo "Installing with DB: host=$DB_HOST db=$DB_NAME user=$DB_USER port=$DB_PORT"
+
+          # 4) Run the official OpenCart CLI installer
+          docker compose exec -T "$PHP_SVC" sh -lc "php '$INSTALLER_IN_PHP' install \
             --db_hostname '$DB_HOST' \
             --db_username '$DB_USER' \
             --db_password '$DB_PASS' \
@@ -129,6 +167,7 @@ jobs:
             --password admin123 \
             --email admin@example.com \
             --http_server '${LOCAL_BASE_URL%/}/'"
+
 
       - name: Wait for OpenCart to be reachable
         shell: bash
