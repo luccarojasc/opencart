@@ -57,8 +57,5 @@ jobs:
       - name: Trigger testRigor suite against localhost
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
-        run: |
-          testrigor test-suite run "$OPENCART_SUITE_ID" \
-            --token "$TESTRIGOR_CI_TOKEN" \
-            --localhost --url "$LOCAL_BASE_URL"
+          run: testrigor run --suite-id=${{ vars.OPENCART_SUITE_ID }} --token=${{ secrets.TESTRIGOR_CI_TOKEN }} --url=http://localhost
 
