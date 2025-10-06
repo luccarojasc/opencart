@@ -54,10 +54,21 @@ jobs:
       - name: Install testRigor CLI
         run: npm i -g testrigor-cli
 
+      - name: Verify CLI is installed
+        run: |
+          which testrigor || true
+          testrigor --version || true
+          npx -y testrigor-cli --version
+
       - name: Trigger testRigor suite against localhost
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
         run: |
-          testrigor test-suite run "$OPENCART_SUITE_ID" \
+          echo "Suite ID: $TESTRIGOR_SUITE_ID"
+          echo "URL:      $LOCAL_BASE_URL"
+          # Use npx to ensure the correct CLI binary/version is used
+          npx -y testrigor-cli test-suite run "$TESTRIGOR_SUITE_ID" \
             --token "$TESTRIGOR_CI_TOKEN" \
-            --localhost --url "$LOCAL_BASE_URL"
+            --localhost --url "$LOCAL_BASE_URL" \
+            --verbose
+
