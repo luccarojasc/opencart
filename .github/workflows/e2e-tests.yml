@@ -58,7 +58,7 @@ jobs:
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
         run: |
-          testrigor test-suite run "$TESTRIGOR_SUITE_ID" \
+          testrigor test-suite run "$OPENCART_SUITE_ID" \
             --token "$TESTRIGOR_CI_TOKEN" \
             --localhost --url "$LOCAL_BASE_URL"
 
