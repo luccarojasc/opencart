@@ -1,4 +1,4 @@
-name: testRigor E2E on OpenCart 
+name: testRigor E2E on OpenCart (localhost)
 
 on:
   push:
@@ -9,171 +9,131 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     env:
-      LOCAL_BASE_URL: http://127.0.0.1/
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 1) Packages: Apache, MariaDB, PHP (+extensions), utils
-      - name: Install system packages
+      - name: Start services (docker-compose)
         run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -y install \
-            apache2 mariadb-server unzip git rsync curl
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -y install \
-            php php-cli php-common php-mysql php-gd php-curl php-zip php-xml php-mbstring
-          sudo a2enmod rewrite
-          # systemctl is not available on hosted runners; use service instead
-          sudo service apache2 start
-          sudo service apache2 status || true
-          php -v
+          docker compose -f docker-compose.yml up -d --build --remove-orphans --quiet-pull
+          docker compose ps
 
-      # 2) FULL MariaDB reset (destructive) and DB/user creation
-      - name: Reset MariaDB datadir and initialize
+      - name: Detect services and URL
+        shell: bash
         run: |
           set -e
-          sudo service mariadb stop || true
-          sudo rm -f /var/run/mysqld/mysqld.pid 2>/dev/null || true
-          sudo sed -i '/innodb_force_recovery/d' /etc/mysql/mariadb.conf.d/50-server.cnf 2>/dev/null || true
+          # Defaults based on the OpenCart repo compose
+          WEB_SVC=apache
+          PHP_SVC=php
+          DB_SVC=mysql
 
-          sudo rm -rf /var/lib/mysql/*
-          sudo mkdir -p /var/lib/mysql /var/run/mysqld
-          sudo chown -R mysql:mysql /var/lib/mysql /var/run/mysqld
+          # Verify / autodetect if names differ
+          if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
+            PHP_SVC=""
+            for s in $(docker compose ps --services); do
+              if docker compose exec -T "$s" sh -lc 'command -v php >/dev/null 2>&1' 2>/dev/null; then
+                PHP_SVC="$s"; break
+              fi
+            done
+          fi
+          if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
+            WEB_SVC=$(docker compose ps --services | head -n1)
+          fi
+          if ! docker compose ps --services | grep -qx "$DB_SVC"; then
+            for s in $(docker compose ps --services); do
+              if docker compose exec -T "$s" sh -lc 'test -d /var/lib/mysql || test -d /bitnami/mariadb' >/dev/null 2>&1; then
+                DB_SVC="$s"; break
+              fi
+            done
+          fi
 
-          if command -v mariadb-install-db >/dev/null 2>&1; then
-            sudo mariadb-install-db --no-defaults --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+          if [ -z "$PHP_SVC" ]; then echo "::error::No container with PHP CLI found"; exit 1; fi
+          echo "WEB_SVC=$WEB_SVC"   >> "$GITHUB_ENV"
+          echo "PHP_SVC=$PHP_SVC"   >> "$GITHUB_ENV"
+          echo "DB_SVC=$DB_SVC"     >> "$GITHUB_ENV"
+
+          # Locate installer inside PHP container
+          INSTALLER=""
+          for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
+            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
+          done
+          if [ -z "$INSTALLER" ]; then
+            echo "::error::Could not find upload/install/cli_install.php in $PHP_SVC"
+            exit 1
+          fi
+          echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
+
+          # Derive published HTTP port (80 or 8080 commonly)
+          PORT=$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1)
+          if [ -z "$PORT" ]; then
+            PORT=$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1)
+          fi
+          if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
+            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           else
-            sudo mysql_install_db  --no-defaults --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+            echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
 
-          sudo service mariadb start
-          sudo service mariadb status || true
-
-      - name: Create OpenCart database and user
-        run: |
-          sudo mysql <<'SQL'
-          CREATE DATABASE IF NOT EXISTS opencart CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
-          CREATE USER IF NOT EXISTS 'oc_user'@'127.0.0.1' IDENTIFIED BY 'Password#123!';
-          CREATE USER IF NOT EXISTS 'oc_user'@'localhost'   IDENTIFIED BY 'Password#123!';
-          GRANT ALL PRIVILEGES ON opencart.* TO 'oc_user'@'127.0.0.1';
-          GRANT ALL PRIVILEGES ON opencart.* TO 'oc_user'@'localhost';
-          FLUSH PRIVILEGES;
-          SQL
-
-          # quick test (prints 1)
-          mysql -h 127.0.0.1 -P 3306 -u oc_user -pPassword#123! opencart -e "SELECT 1;"
-
-      # 3) Get OpenCart code (fresh), place under /var/www/opencart
-      - name: Fetch OpenCart code
+      - name: Install OpenCart via CLI
+        shell: bash
         run: |
           set -e
-          sudo rm -rf /var/www/opencart
-          sudo mkdir -p /var/www/opencart
 
-          rm -rf /tmp/opencart-src
-          git clone --depth=1 https://github.com/opencart/opencart.git /tmp/opencart-src
-          sudo rsync -a /tmp/opencart-src/upload/ /var/www/opencart/
+          # Pull DB creds from DB container env (handles MYSQL_* or MARIADB_*)
+          DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)
 
-          cd /var/www/opencart
-          sudo cp config-dist.php config.php
-          sudo cp admin/config-dist.php admin/config.php
+          val() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2-; }
+          DB_HOST="$DB_SVC"; DB_PORT=3306; DB_NAME=opencart; DB_USER=root; DB_PASS=root
 
-          sudo chown -R www-data:www-data /var/www/opencart
-          find /var/www/opencart -type d -exec sudo chmod 755 {} \;
-          find /var/www/opencart -type f -exec sudo chmod 644 {} \;
-          # make configs writable for install
-          sudo chmod 664 /var/www/opencart/config.php /var/www/opencart/admin/config.php
+          DB_NAME_FROM_ENV=$(val MYSQL_DATABASE);  [ -z "$DB_NAME_FROM_ENV" ]  && DB_NAME_FROM_ENV=$(val MARIADB_DATABASE)
+          DB_USER_FROM_ENV=$(val MYSQL_USER);      [ -z "$DB_USER_FROM_ENV" ]  && DB_USER_FROM_ENV=$(val MARIADB_USER)
+          DB_PASS_FROM_ENV=$(val MYSQL_PASSWORD);  [ -z "$DB_PASS_FROM_ENV" ]  && DB_PASS_FROM_ENV=$(val MARIADB_PASSWORD)
+          ROOT_FROM_ENV=$(val MYSQL_ROOT_PASSWORD);[ -z "$ROOT_FROM_ENV" ]     && ROOT_FROM_ENV=$(val MARIADB_ROOT_PASSWORD)
 
-      # 4) Apache VirtualHost pointing to /var/www/opencart
-      - name: Configure Apache vhost for OpenCart
-        run: |
-          sudo tee /etc/apache2/sites-available/opencart.conf >/dev/null <<'APACHE'
-          <VirtualHost *:80>
-            ServerName  _default_
-            DocumentRoot /var/www/opencart
-
-            <Directory /var/www/opencart>
-              AllowOverride All
-              Require all granted
-            </Directory>
-
-            ErrorLog ${APACHE_LOG_DIR}/opencart_error.log
-            CustomLog ${APACHE_LOG_DIR}/opencart_access.log combined
-          </VirtualHost>
-          APACHE
-
-          sudo a2dissite 000-default.conf 2>/dev/null || true
-          sudo a2ensite opencart.conf
-          sudo service apache2 reload
-
-          # quick sanity
-          curl -I http://127.0.0.1/ || true
-
-      # 5) OpenCart installation via CLI (if available), else fall back to web bootstrap
-      - name: Install OpenCart (CLI if present)
-        run: |
-          set -e
-          if [ -f /var/www/opencart/install/cli_install.php ]; then
-            php /var/www/opencart/install/cli_install.php install \
-              --db_hostname=127.0.0.1 \
-              --db_username=oc_user \
-              --db_password='Password#123!' \
-              --db_database=opencart \
-              --db_driver=mysqli \
-              --db_port=3306 \
-              --username=admin \
-              --password='Opencart123' \
-              --email='testing+opencart@testrigor.com' \
-              --http_server="${LOCAL_BASE_URL}"
-          else
-            echo "cli_install.php not found; proceeding without it (store may require web install)."
+          [ -n "$DB_NAME_FROM_ENV" ] && DB_NAME="$DB_NAME_FROM_ENV"
+          if [ -n "$DB_USER_FROM_ENV" ]; then
+            DB_USER="$DB_USER_FROM_ENV"; DB_PASS="$DB_PASS_FROM_ENV"
+          elif [ -n "$ROOT_FROM_ENV" ]; then
+            DB_USER="root"; DB_PASS="$ROOT_FROM_ENV"
           fi
 
-          # remove installer directory if present
-          sudo rm -rf /var/www/opencart/install/
+          echo "Installing OpenCart with DB: $DB_USER@$DB_HOST/$DB_NAME"
 
-      # 6) Post-install hardening + SEO tweaks
-      - name: Post-install: move storage and (optionally) rename admin
-        run: |
-          set -e
-          # move system/storage outside webroot
-          sudo mkdir -p /var/storage_oc
-          if [ -d /var/www/opencart/system/storage ]; then
-            sudo rsync -a /var/www/opencart/system/storage/ /var/storage_oc/
-          fi
-          sudo chown -R www-data:www-data /var/storage_oc
+          docker compose exec -T "$PHP_SVC" sh -lc "php '$INSTALLER' install \
+            --db_hostname '$DB_HOST' \
+            --db_username '$DB_USER' \
+            --db_password '$DB_PASS' \
+            --db_database '$DB_NAME' \
+            --db_driver mysqli \
+            --db_port '$DB_PORT' \
+            --username admin \
+            --password admin123 \
+            --email admin@example.com \
+            --http_server '${LOCAL_BASE_URL%/}/'"
 
-          # update DIR_STORAGE in configs
-          sudo sed -i "s#^define('DIR_STORAGE'.*#define('DIR_STORAGE', '/var/storage_oc/');#g" /var/www/opencart/config.php || true
-          sudo sed -i "s#^define('DIR_STORAGE'.*#define('DIR_STORAGE', '/var/storage_oc/');#g" /var/www/opencart/admin/config.php || true
+          # Clean installer dir if left behind
+          docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
-          # OPTIONAL: rename /admin to /adm (safe if you want it)
-          if [ -d /var/www/opencart/admin ]; then
-            sudo mv /var/www/opencart/admin /var/www/opencart/adm
-            sudo sed -i "s#/admin/#/adm/#g" /var/www/opencart/adm/config.php || true
-            sudo sed -i "s#opencart/admin/#opencart/adm/#g" /var/www/opencart/adm/config.php || true
-          fi
-
-          sudo service apache2 restart
-
-      # Wait for the site to answer 200s consistently before triggering tests
-      - name: Wait for OpenCart to be reachable (curl)
+      - name: Wait for OpenCart to be reachable
+        shell: bash
         run: |
           for i in {1..60}; do
-            if curl -fsS -o /dev/null -L "${LOCAL_BASE_URL}"; then
-              echo "OpenCart is up at ${LOCAL_BASE_URL}"; exit 0
+            if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
+              echo "OpenCart is up at $LOCAL_BASE_URL"
+              exit 0
             fi
-            echo "Waiting for OpenCart... ($i/60)"; sleep 5
+            echo "Waiting for OpenCart... ($i/60)"
+            sleep 5
           done
-          echo "OpenCart failed to start in time" >&2; exit 1
+          echo "OpenCart failed to start in time" >&2
+          exit 1
 
       - name: Verify HTTP headers (sanity)
-        run: curl -LI "${LOCAL_BASE_URL}" || true
+        run: curl -LI "$LOCAL_BASE_URL" || true
 
-      # testRigor: Node + CLI and run against localhost
-      - name: Setup Node.js
+      - name: Setup Node.js (for testRigor CLI)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -182,7 +142,6 @@ jobs:
         run: |
           npm i -g testrigor-cli
           testrigor --version || true
-          npx -y testrigor-cli --version
 
       - name: Trigger testRigor suite against localhost
         env:
