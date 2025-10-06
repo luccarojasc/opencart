@@ -20,7 +20,7 @@ jobs:
           docker compose -f docker-compose.yml up -d --remove-orphans
           docker compose ps
 
-      # Detect which port was published and export LOCAL_BASE_URL
+      # Detect which port is published and export LOCAL_BASE_URL for later steps
       - name: Detect OpenCart URL
         shell: bash
         run: |
@@ -57,5 +57,7 @@ jobs:
       - name: Trigger testRigor suite against localhost
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
-          run: testrigor run --suite-id=${{ vars.OPENCART_SUITE_ID }} --token=${{ secrets.TESTRIGOR_CI_TOKEN }} --url=http://localhost
-
+        run: |
+          testrigor test-suite run "$OPENCART_SUITE_ID" \
+            --token "$TESTRIGOR_CI_TOKEN" \
+            --localhost --url "$LOCAL_BASE_URL"
