@@ -9,21 +9,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     env:
-      # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
-
-      # OpenCart auto-install knobs (used by the php service in docker-compose)
-      OPENCART_USERNAME: admin
-      OPENCART_PASSWORD: admin123
-      OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
-      OPENCART_HTTP_SERVER: http://localhost/   # compose uses this to set store URL
-      DB_DRIVER: mysqli
-      DB_HOSTNAME: mysql
-      DB_USERNAME: opencart
-      DB_PASSWORD: opencart
-      DB_DATABASE: opencart
-      DB_PORT: "3306"
-      DB_PREFIX: oc_
 
     steps:
       - name: Checkout repo
@@ -38,13 +24,53 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Choose the web service (commonly 'apache')
+
+          # Defaults based on the OpenCart compose
           WEB_SVC="apache"
+          PHP_SVC="php"
+          DB_SVC="mysql"
+
+          # Autodetect if names differ
+          if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
+            PHP_SVC=""
+            for s in $(docker compose ps --services); do
+              if docker compose exec -T "$s" sh -lc 'command -v php >/dev/null 2>&1' 2>/dev/null; then
+                PHP_SVC="$s"; break
+              fi
+            done
+          fi
           if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose ps --services | head -n1)"
           fi
+          if ! docker compose ps --services | grep -qx "$DB_SVC"; then
+            for s in $(docker compose ps --services); do
+              if docker compose exec -T "$s" sh -lc 'test -d /var/lib/mysql || test -d /bitnami/mariadb' >/dev/null 2>&1; then
+                DB_SVC="$s"; break
+              fi
+            done
+          fi
 
-          # Derive published HTTP port (80 or 8080)
+          if [ -z "$PHP_SVC" ]; then
+            echo "::error::No container with PHP CLI found"; exit 1
+          fi
+
+          echo "WEB_SVC=$WEB_SVC"   >> "$GITHUB_ENV"
+          echo "PHP_SVC=$PHP_SVC"   >> "$GITHUB_ENV"
+          echo "DB_SVC=$DB_SVC"     >> "$GITHUB_ENV"
+
+          # Find installer path in the PHP container
+          INSTALLER=""
+          for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
+            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then
+              INSTALLER="$p"; break
+            fi
+          done
+          if [ -z "$INSTALLER" ]; then
+            echo "::error::Could not find upload/install/cli_install.php in $PHP_SVC"; exit 1
+          fi
+          echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
+
+          # Resolve published HTTP port -> LOCAL_BASE_URL
           PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ]; then
             PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
@@ -54,20 +80,82 @@ jobs:
           else
             echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
-          echo "Resolved LOCAL_BASE_URL=$(cat $GITHUB_ENV | grep LOCAL_BASE_URL | cut -d= -f2-)"
+
+      - name: Install OpenCart via CLI (robust)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Using PHP_SVC=$PHP_SVC  DB_SVC=$DB_SVC  LOCAL_BASE_URL=$LOCAL_BASE_URL"
+          echo "Installer path: $INSTALLER"
+
+          # Read DB envs from DB container (works for MYSQL_* or MARIADB_*)
+          DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)
+          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2-; }
+
+          DB_HOST="$DB_SVC"
+          DB_PORT="${DB_PORT:-3306}"
+          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)" || true
+          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)" || true
+          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)" || true
+          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)" || true
+
+          # Fallback to root if no regular user is set
+          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
+          : "${DB_NAME:=opencart}"
+
+          echo "Installing with DB: $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME"
+          set -x
+          docker compose exec -T "$PHP_SVC" sh -lc "php '$INSTALLER' install \
+            --db_hostname '$DB_HOST' \
+            --db_username '$DB_USER' \
+            --db_password '$DB_PASS' \
+            --db_database '$DB_NAME' \
+            --db_driver mysqli \
+            --db_port '$DB_PORT' \
+            --username admin \
+            --password admin123 \
+            --email admin@example.com \
+            --http_server '${LOCAL_BASE_URL%/}/'"
+          set +x
+
+          # Remove installer folder if left
+          docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
+
+      - name: Ensure default currency set (USD)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${DB_SVC:=mysql}"
+          PREFIX="${DB_PREFIX:-oc_}"
+
+          DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)
+          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2-; }
+
+          DB_HOST="$DB_SVC"
+          DB_PORT="${DB_PORT:-3306}"
+          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)" || true
+          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)" || true
+          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)" || true
+          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)" || true
+          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
+          : "${DB_NAME:=opencart}"
+
+          SQL="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
+               VALUES (0,'config','config_currency','USD')
+               ON DUPLICATE KEY UPDATE value='USD';"
+
+          docker compose exec -T "$DB_SVC" sh -lc \
+            "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$SQL\"" || true
 
       - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
           set -e
-          # Allow auto-install in php container to finish; poll front page
           for i in {1..90}; do
             if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
-              echo "OpenCart is up at $LOCAL_BASE_URL"
-              exit 0
+              echo "OpenCart is up at $LOCAL_BASE_URL"; exit 0
             fi
-            echo "Waiting for OpenCart... ($i/90)"
-            sleep 3
+            echo "Waiting for OpenCart... ($i/90)"; sleep 3
           done
           echo "::group::Recent container logs"
           docker compose logs --no-color --tail=200
@@ -86,6 +174,7 @@ jobs:
         run: |
           npm i -g testrigor-cli
           testrigor --version || true
+          npx -y testrigor-cli --version || true
 
       - name: Trigger testRigor suite against localhost
         env:
