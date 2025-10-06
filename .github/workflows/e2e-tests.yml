@@ -7,71 +7,52 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-
-    # Start OpenCart + DB as service containers and expose them to localhost
-    services:
-      db:
-        image: mariadb:10.6
-        env:
-          MARIADB_ROOT_PASSWORD: root
-          MARIADB_DATABASE: opencart
-          MARIADB_USER: oc
-          MARIADB_PASSWORD: ocpass
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -u$$MARIADB_USER -p$$MARIADB_PASSWORD || exit 1"
-          --health-interval=10s --health-timeout=5s --health-retries=10
-
-      opencart:
-        image: bitnami/opencart:latest
-        env:
-          OPENCART_HOST: localhost
-          OPENCART_USERNAME: admin
-          OPENCART_PASSWORD: admin123
-          OPENCART_EMAIL: admin@example.com
-          MARIADB_HOST: 127.0.0.1
-          MARIADB_PORT_NUMBER: 3306
-          MARIADB_DATABASE: opencart
-          MARIADB_USER: oc
-          MARIADB_PASSWORD: ocpass
-          ALLOW_EMPTY_PASSWORD: "yes"
-        # Map container’s HTTP port to host port 80 so we can curl http://localhost
-        ports:
-          - 80:8080
-
     env:
-      LOCAL_BASE_URL: http://localhost
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Wait for OpenCart to be reachable (curl http://localhost)
+      # Start OpenCart using the repo's docker-compose
+      - name: Start OpenCart (docker-compose)
+        run: |
+          docker compose -f docker-compose.yml up -d --remove-orphans
+          docker compose ps
+
+      # Detect which port was published and export LOCAL_BASE_URL
+      - name: Detect OpenCart URL
+        shell: bash
+        run: |
+          if curl -fsSI http://localhost >/dev/null; then
+            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
+          elif curl -fsSI http://localhost:8080 >/dev/null; then
+            echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
+          else
+            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
+          fi
+
+      - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
           for i in {1..60}; do
             if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
-              echo "OpenCart is up."
-              exit 0
+              echo "OpenCart is up at $LOCAL_BASE_URL"; exit 0
             fi
-            echo "Waiting for OpenCart... ($i/60)"
-            sleep 5
+            echo "Waiting for OpenCart... ($i/60)"; sleep 5
           done
-          echo "OpenCart failed to start in time" >&2
-          exit 1
+          echo "OpenCart failed to start in time" >&2; exit 1
 
       - name: Verify HTTP headers (sanity)
         run: curl -LI "$LOCAL_BASE_URL" || true
 
-      - name: Setup Node.js (for testRigor CLI)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install testRigor CLI
-        run: npm install -g testrigor-cli
+        run: npm i -g testrigor-cli
 
       - name: Trigger testRigor suite against localhost
         env:
@@ -80,3 +61,4 @@ jobs:
           testrigor test-suite run "$TESTRIGOR_SUITE_ID" \
             --token "$TESTRIGOR_CI_TOKEN" \
             --localhost --url "$LOCAL_BASE_URL"
+
