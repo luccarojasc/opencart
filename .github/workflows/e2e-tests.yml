@@ -164,21 +164,25 @@ jobs:
 
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
-      - name: Disable PHP error display (avoid notices rendering pages)
+      - name: Silence PHP notices via .user.ini (applies per-request)
         shell: bash
         run: |
           set -euo pipefail
           : "${PHP_SVC:=php}"
           docker compose exec -T "$PHP_SVC" sh -lc '
-            INI_DIR="$(php -i | awk -F"=> " "/Scan this dir for additional .ini files/ {print \$2}" | xargs || true)"
-            [ -z "$INI_DIR" ] && INI_DIR="/usr/local/etc/php/conf.d"
-            echo "display_errors=0" >  "$INI_DIR/zz-ci.ini"
-            echo "display_startup_errors=0" >> "$INI_DIR/zz-ci.ini"
-            echo "error_reporting=E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT" >> "$INI_DIR/zz-ci.ini"
+            set -e
+            DOCROOT=""
+            for d in /var/www/html/upload /var/www/upload; do
+              if [ -d "$d" ]; then DOCROOT="$d"; break; fi
+            done
+            [ -z "$DOCROOT" ] && { echo "Docroot not found"; exit 1; }
+            cat > "$DOCROOT/.user.ini" <<INI
+            display_errors=0
+            display_startup_errors=0
+            error_reporting=E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
+            INI
           '
-          # restart php-fpm & web to pick up ini
-          docker compose restart "$PHP_SVC" || true
-          docker compose restart "$WEB_SVC" || true
+          # No restart needed; .user.ini is read on each request
 
       - name: Ensure default currency set (USD) & disable OC error display
         shell: bash
@@ -189,8 +193,7 @@ jobs:
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2- || true; }
 
-          DB_HOST="$DB_SVC"
-          DB_PORT="${DB_PORT:-3306}"
+          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
           DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)" || true
           DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)" || true
           DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)" || true
@@ -208,7 +211,6 @@ jobs:
             docker compose exec -T "$DB_SVC" sh -lc \
               "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
           fi
-
           UPSERT_ERRDISP="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
                           VALUES (0,'config','config_error_display','0')
                           ON DUPLICATE KEY UPDATE value='0';"
