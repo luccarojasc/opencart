@@ -164,25 +164,25 @@ jobs:
 
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
-      - name: Silence PHP notices via .user.ini (applies per-request)
+      - name: Hard-disable PHP error display in OpenCart entrypoints
         shell: bash
         run: |
           set -euo pipefail
           : "${PHP_SVC:=php}"
-          docker compose exec -T "$PHP_SVC" sh -lc '
+          docker compose exec -T "$PHP_SVC" bash -lc '
             set -e
-            DOCROOT=""
-            for d in /var/www/html/upload /var/www/upload; do
-              if [ -d "$d" ]; then DOCROOT="$d"; break; fi
+            prepend_block="<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); ?>"
+            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
+              # storefront
+              if [ -f "$root/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/index.php"; then
+                printf "%s\n" "$prepend_block" | cat - "$root/index.php" > "$root/index.php.ci" && mv "$root/index.php.ci" "$root/index.php"
+              fi
+              # admin
+              if [ -f "$root/admin/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/admin/index.php"; then
+                printf "%s\n" "$prepend_block" | cat - "$root/admin/index.php" > "$root/admin/index.php.ci" && mv "$root/admin/index.php.ci" "$root/admin/index.php"
+              fi
             done
-            [ -z "$DOCROOT" ] && { echo "Docroot not found"; exit 1; }
-            cat > "$DOCROOT/.user.ini" <<INI
-            display_errors=0
-            display_startup_errors=0
-            error_reporting=E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
-            INI
           '
-          # No restart needed; .user.ini is read on each request
 
       - name: Ensure default currency set (USD) & disable OC error display
         shell: bash
