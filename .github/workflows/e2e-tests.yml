@@ -25,7 +25,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Defaults based on the OpenCart compose
+          # Defaults from OpenCart compose
           WEB_SVC="apache"
           PHP_SVC="php"
           DB_SVC="mysql"
@@ -50,24 +50,18 @@ jobs:
             done
           fi
 
-          if [ -z "$PHP_SVC" ]; then
-            echo "::error::No container with PHP CLI found"; exit 1
-          fi
+          [ -z "$PHP_SVC" ] && { echo "::error::No container with PHP CLI found"; exit 1; }
 
-          echo "WEB_SVC=$WEB_SVC"   >> "$GITHUB_ENV"
-          echo "PHP_SVC=$PHP_SVC"   >> "$GITHUB_ENV"
-          echo "DB_SVC=$DB_SVC"     >> "$GITHUB_ENV"
+          echo "WEB_SVC=$WEB_SVC" >> "$GITHUB_ENV"
+          echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
+          echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
 
-          # Find installer path in the PHP container
+          # Find installer in PHP container
           INSTALLER=""
           for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
-            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then
-              INSTALLER="$p"; break
-            fi
+            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
           done
-          if [ -z "$INSTALLER" ]; then
-            echo "::error::Could not find upload/install/cli_install.php in $PHP_SVC"; exit 1
-          fi
+          [ -z "$INSTALLER" ] && { echo "::error::Could not find upload/install/cli_install.php in $PHP_SVC"; exit 1; }
           echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
 
           # Resolve published HTTP port -> LOCAL_BASE_URL
@@ -81,6 +75,56 @@ jobs:
             echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
 
+      - name: Wait for DB to be ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${DB_SVC:=mysql}"
+
+          # Try both mysqladmin (root) and mysql (regular user) using env from the DB container
+          DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)
+          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2-; }
+
+          HOST="127.0.0.1"
+          PORT="${DB_PORT:-3306}"
+          U="$(getv MYSQL_USER)";      [ -z "$U" ] && U="$(getv MARIADB_USER)" || true
+          P="$(getv MYSQL_PASSWORD)";  [ -z "$P" ] && P="$(getv MARIADB_PASSWORD)" || true
+          R="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$R" ] && R="$(getv MARIADB_ROOT_PASSWORD)" || true
+          D="$(getv MYSQL_DATABASE)";  [ -z "$D" ] && D="$(getv MARIADB_DATABASE)" || true
+
+          for i in {1..60}; do
+            if docker compose exec -T "$DB_SVC" sh -lc "mysqladmin ping -h $HOST -uroot -p'$R' --silent" 2>/dev/null; then
+              echo "DB ready (root)"; break
+            elif [ -n "$U" ] && docker compose exec -T "$DB_SVC" sh -lc "mysql -h $HOST -P $PORT -u'$U' -p'$P' '$D' -e 'SELECT 1'" >/dev/null 2>&1; then
+              echo "DB ready ($U)"; break
+            fi
+            echo "Waiting for DB... ($i/60)"; sleep 2
+            [ "$i" -eq 60 ] && { echo "::error::DB did not become ready"; exit 1; }
+          done
+
+      - name: Prepare config files & permissions (inside PHP container)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PHP_SVC:=php}"
+
+          docker compose exec -T "$PHP_SVC" sh -lc '
+            set -e
+            ROOT=""
+            for b in /var/www/html /var/www; do
+              if [ -f "$b/upload/config-dist.php" ]; then ROOT="$b"; break; fi
+            done
+            [ -z "$ROOT" ] && { echo "Cannot locate /var/www*/upload"; exit 1; }
+
+            # Create config files from -dist if missing and make writable
+            cp -n "$ROOT/upload/config-dist.php" "$ROOT/upload/config.php" || true
+            cp -n "$ROOT/upload/admin/config-dist.php" "$ROOT/upload/admin/config.php" || true
+            chmod 666 "$ROOT/upload/config.php" "$ROOT/upload/admin/config.php" || true
+
+            # Ensure www-data owns code (common requirement for installer)
+            chown -R www-data:www-data "$ROOT/upload" || true
+          '
+
       - name: Install OpenCart via CLI (robust)
         shell: bash
         run: |
@@ -88,7 +132,6 @@ jobs:
           echo "Using PHP_SVC=$PHP_SVC  DB_SVC=$DB_SVC  LOCAL_BASE_URL=$LOCAL_BASE_URL"
           echo "Installer path: $INSTALLER"
 
-          # Read DB envs from DB container (works for MYSQL_* or MARIADB_*)
           DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)
           getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2-; }
 
@@ -98,12 +141,9 @@ jobs:
           DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)" || true
           DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)" || true
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)" || true
-
-          # Fallback to root if no regular user is set
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
 
-          echo "Installing with DB: $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME"
           set -x
           docker compose exec -T "$PHP_SVC" sh -lc "php '$INSTALLER' install \
             --db_hostname '$DB_HOST' \
@@ -115,10 +155,10 @@ jobs:
             --username admin \
             --password admin123 \
             --email admin@example.com \
-            --http_server '${LOCAL_BASE_URL%/}/'"
+            --http_server '${LOCAL_BASE_URL%/}/'" \
+          || { set +x; echo '::error::CLI install failed; recent container logs:'; docker compose logs --no-color --tail=300; exit 1; }
           set +x
 
-          # Remove installer folder if left
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
       - name: Ensure default currency set (USD)
@@ -158,7 +198,7 @@ jobs:
             echo "Waiting for OpenCart... ($i/90)"; sleep 3
           done
           echo "::group::Recent container logs"
-          docker compose logs --no-color --tail=200
+          docker compose logs --no-color --tail=300
           echo "::endgroup::"
           exit 1
 
