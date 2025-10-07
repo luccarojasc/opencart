@@ -24,8 +24,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          # Defaults from OpenCart compose
           WEB_SVC="apache"
           PHP_SVC="php"
           DB_SVC="mysql"
@@ -49,22 +47,21 @@ jobs:
               fi
             done
           fi
-
           [ -z "$PHP_SVC" ] && { echo "::error::No container with PHP CLI found"; exit 1; }
 
           echo "WEB_SVC=$WEB_SVC" >> "$GITHUB_ENV"
           echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
           echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
 
-          # Find installer in PHP container
+          # Find installer
           INSTALLER=""
           for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
             if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
           done
-          [ -z "$INSTALLER" ] && { echo "::error::Could not find upload/install/cli_install.php in $PHP_SVC"; exit 1; }
+          [ -z "$INSTALLER" ] && { echo "::error::Could not find upload/install/cli_install.php"; exit 1; }
           echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
 
-          # Resolve published HTTP port -> LOCAL_BASE_URL
+          # Resolve URL
           PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ]; then
             PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
@@ -80,46 +77,31 @@ jobs:
         run: |
           set -eo pipefail
           : "${DB_SVC:=mysql}"
-
-          # Wait for container health=healthy
           CID="$(docker compose ps -q "$DB_SVC")"
           if [ -z "$CID" ]; then
-            echo "::error::Cannot find DB container for service '$DB_SVC'"
-            docker compose ps
-            exit 1
+            echo "::error::Cannot find DB container for service '$DB_SVC'"; docker compose ps; exit 1
           fi
-
           echo "Waiting for DB container ($DB_SVC) healthcheck…"
           for i in {1..60}; do
             STATUS="$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo unknown)"
-            if [ "$STATUS" = "healthy" ]; then
-              echo "DB is healthy."; break
-            fi
+            if [ "$STATUS" = "healthy" ]; then echo "DB is healthy."; break; fi
             echo "DB health: $STATUS ($i/60)"; sleep 2
             if [ "$i" -eq 60 ]; then
               echo "::warning::Healthcheck not healthy after timeout; trying mysqladmin ping…"
+              docker compose exec -T "$DB_SVC" sh -lc \
+                "mysqladmin ping -h 127.0.0.1 --silent || \
+                 mysqladmin ping -h 127.0.0.1 -uroot --silent || \
+                 mysqladmin ping -h 127.0.0.1 -uroot -p\${MYSQL_ROOT_PASSWORD:-\${MARIADB_ROOT_PASSWORD:-}} --silent" \
+                || { echo '::error::DB did not respond to mysqladmin ping'; docker compose logs --no-color --tail=200 "$DB_SVC"; exit 1; }
+              break
             fi
           done
-
-          # Fallback: try mysqladmin ping with any creds we can find
-          if [ "${STATUS:-}" != "healthy" ]; then
-            echo "Attempting mysqladmin ping (fallback)…"
-            # Root or regular user – try a few common options without failing the script
-            docker compose exec -T "$DB_SVC" sh -lc \
-              "mysqladmin ping -h 127.0.0.1 --silent || \
-               mysqladmin ping -h 127.0.0.1 -uroot --silent || \
-               mysqladmin ping -h 127.0.0.1 -uroot -p\${MYSQL_ROOT_PASSWORD:-\${MARIADB_ROOT_PASSWORD:-}} --silent" \
-              || { echo '::error::DB is not responding to mysqladmin ping'; docker compose logs --no-color --tail=200 "$DB_SVC"; exit 1; }
-            echo "DB responded to mysqladmin ping."
-          fi
-
 
       - name: Prepare config files & permissions (inside PHP container)
         shell: bash
         run: |
           set -euo pipefail
           : "${PHP_SVC:=php}"
-
           docker compose exec -T "$PHP_SVC" sh -lc '
             set -e
             ROOT=""
@@ -127,13 +109,9 @@ jobs:
               if [ -f "$b/upload/config-dist.php" ]; then ROOT="$b"; break; fi
             done
             [ -z "$ROOT" ] && { echo "Cannot locate /var/www*/upload"; exit 1; }
-
-            # Create config files from -dist if missing and make writable
             cp -n "$ROOT/upload/config-dist.php" "$ROOT/upload/config.php" || true
             cp -n "$ROOT/upload/admin/config-dist.php" "$ROOT/upload/admin/config.php" || true
             chmod 666 "$ROOT/upload/config.php" "$ROOT/upload/admin/config.php" || true
-
-            # Ensure www-data owns code (common requirement for installer)
             chown -R www-data:www-data "$ROOT/upload" || true
           '
 
@@ -141,11 +119,9 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           echo "Using PHP_SVC=$PHP_SVC  DB_SVC=$DB_SVC  LOCAL_BASE_URL=$LOCAL_BASE_URL"
           echo "Installer path: $INSTALLER"
 
-          # Helper to fetch values from DB container env without failing on missing vars
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2- || true; }
 
@@ -158,33 +134,22 @@ jobs:
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
 
-          # On any error, show logs from php/apache/mysql for quick diagnosis
           trap '
-            echo "::group::PHP container logs"
-            docker compose logs --no-color --tail=200 "$PHP_SVC" || true
-            echo "::endgroup::"
-            echo "::group::Apache container logs (if separate)"
-            docker compose logs --no-color --tail=200 apache || true
-            echo "::endgroup::"
-            echo "::group::DB container logs"
-            docker compose logs --no-color --tail=200 "$DB_SVC" || true
-            echo "::endgroup::"
+            echo "::group::PHP logs"; docker compose logs --no-color --tail=200 "$PHP_SVC" || true; echo "::endgroup::"
+            echo "::group::Apache logs"; docker compose logs --no-color --tail=200 apache || true; echo "::endgroup::"
+            echo "::group::DB logs"; docker compose logs --no-color --tail=200 "$DB_SVC" || true; echo "::endgroup::"
           ' ERR
 
-          echo "== PHP version and required extensions =="
+          echo "== PHP modules =="
           docker compose exec -T "$PHP_SVC" sh -lc 'php -v && php -m | sort | egrep -i "mysqli|pdo_mysql|curl|zip|gd|mbstring|xml" -n || true'
 
           echo "== DB connectivity from PHP container =="
           docker compose exec -T "$PHP_SVC" sh -lc "php -r '
-            \$h=getenv(\"DB_HOST\")?:\"$DB_HOST\";
-            \$u=getenv(\"DB_USER\")?:\"$DB_USER\";
-            \$p=getenv(\"DB_PASS\")?:\"$DB_PASS\";
-            \$d=getenv(\"DB_NAME\")?:\"$DB_NAME\";
-            \$m=new mysqli(\$h,\"$DB_USER\",\"$DB_PASS\",\"$DB_NAME\",$DB_PORT);
+            \$m=new mysqli(\"$DB_HOST\",\"$DB_USER\",\"$DB_PASS\",\"$DB_NAME\",$DB_PORT);
             if(\$m->connect_errno){fwrite(STDERR,\"mysqli connect failed: \".\$m->connect_error.\"\\n\"); exit(2);} echo \"mysqli ok\\n\"; \$m->close();
           '"
 
-          echo "== Running OpenCart CLI installer =="
+          echo "== Running installer =="
           docker compose exec -T "$PHP_SVC" sh -lc "php -d display_errors=1 -d error_reporting=32767 '$INSTALLER' install \
             --db_hostname '$DB_HOST' \
             --db_username '$DB_USER' \
@@ -197,18 +162,30 @@ jobs:
             --email admin@example.com \
             --http_server '${LOCAL_BASE_URL%/}/'"
 
-          echo "== Removing installer directory (if left behind) =="
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
+      - name: Disable PHP error display (avoid notices rendering pages)
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PHP_SVC:=php}"
+          docker compose exec -T "$PHP_SVC" sh -lc '
+            INI_DIR="$(php -i | awk -F"=> " "/Scan this dir for additional .ini files/ {print \$2}" | xargs || true)"
+            [ -z "$INI_DIR" ] && INI_DIR="/usr/local/etc/php/conf.d"
+            echo "display_errors=0" >  "$INI_DIR/zz-ci.ini"
+            echo "display_startup_errors=0" >> "$INI_DIR/zz-ci.ini"
+            echo "error_reporting=E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT" >> "$INI_DIR/zz-ci.ini"
+          '
+          # restart php-fpm & web to pick up ini
+          docker compose restart "$PHP_SVC" || true
+          docker compose restart "$WEB_SVC" || true
 
-      - name: Ensure default currency set (USD) if missing
+      - name: Ensure default currency set (USD) & disable OC error display
         shell: bash
         run: |
           set -eo pipefail
           : "${DB_SVC:=mysql}"
           PREFIX="${DB_PREFIX:-oc_}"
-
-          # Read DB envs (don’t fail if any are missing)
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2- || true; }
 
@@ -221,23 +198,22 @@ jobs:
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
 
-          # If setting exists, skip; otherwise insert USD
-          READ_SQL="SELECT value FROM ${PREFIX}setting
-                    WHERE store_id=0 AND code='config' AND \`key\`='config_currency' LIMIT 1;"
+          READ_SQL="SELECT value FROM ${PREFIX}setting WHERE store_id=0 AND code='config' AND \`key\`='config_currency' LIMIT 1;"
           VAL="$(docker compose exec -T "$DB_SVC" sh -lc \
             "mysql -N -s -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$READ_SQL\"" || true)"
-
-          if [ -n "$VAL" ]; then
-            echo "config_currency already set to: $VAL"
-          else
-            echo "config_currency missing; setting to USD"
-            UPSERT_SQL="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
+          if [ -z "$VAL" ]; then
+            UPSERT_CCY="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
                         VALUES (0,'config','config_currency','USD')
                         ON DUPLICATE KEY UPDATE value='USD';"
             docker compose exec -T "$DB_SVC" sh -lc \
-              "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_SQL\"" || true
+              "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
           fi
 
+          UPSERT_ERRDISP="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
+                          VALUES (0,'config','config_error_display','0')
+                          ON DUPLICATE KEY UPDATE value='0';"
+          docker compose exec -T "$DB_SVC" sh -lc \
+            "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_ERRDISP\"" || true
 
       - name: Wait for OpenCart to be reachable
         shell: bash
