@@ -137,27 +137,55 @@ jobs:
             chown -R www-data:www-data "$ROOT/upload" || true
           '
 
-      - name: Install OpenCart via CLI (robust)
+      - name: Install OpenCart via CLI (verbose & resilient)
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
           echo "Using PHP_SVC=$PHP_SVC  DB_SVC=$DB_SVC  LOCAL_BASE_URL=$LOCAL_BASE_URL"
           echo "Installer path: $INSTALLER"
 
-          DB_ENV=$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)
-          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2-; }
+          # Helper to fetch values from DB container env without failing on missing vars
+          DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
+          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2- || true; }
 
           DB_HOST="$DB_SVC"
           DB_PORT="${DB_PORT:-3306}"
-          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)" || true
-          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)" || true
-          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)" || true
-          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)" || true
+          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
+          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
+          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
+          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
 
-          set -x
-          docker compose exec -T "$PHP_SVC" sh -lc "php '$INSTALLER' install \
+          # On any error, show logs from php/apache/mysql for quick diagnosis
+          trap '
+            echo "::group::PHP container logs"
+            docker compose logs --no-color --tail=200 "$PHP_SVC" || true
+            echo "::endgroup::"
+            echo "::group::Apache container logs (if separate)"
+            docker compose logs --no-color --tail=200 apache || true
+            echo "::endgroup::"
+            echo "::group::DB container logs"
+            docker compose logs --no-color --tail=200 "$DB_SVC" || true
+            echo "::endgroup::"
+          ' ERR
+
+          echo "== PHP version and required extensions =="
+          docker compose exec -T "$PHP_SVC" sh -lc 'php -v && php -m | sort | egrep -i "mysqli|pdo_mysql|curl|zip|gd|mbstring|xml" -n || true'
+
+          echo "== DB connectivity from PHP container =="
+          docker compose exec -T "$PHP_SVC" sh -lc "php -r '
+            \$h=getenv(\"DB_HOST\")?:\"$DB_HOST\";
+            \$u=getenv(\"DB_USER\")?:\"$DB_USER\";
+            \$p=getenv(\"DB_PASS\")?:\"$DB_PASS\";
+            \$d=getenv(\"DB_NAME\")?:\"$DB_NAME\";
+            \$m=new mysqli(\$h,\"$DB_USER\",\"$DB_PASS\",\"$DB_NAME\",$DB_PORT);
+            if(\$m->connect_errno){fwrite(STDERR,\"mysqli connect failed: \".\$m->connect_error.\"\\n\"); exit(2);} echo \"mysqli ok\\n\"; \$m->close();
+          '"
+
+          echo "== Running OpenCart CLI installer =="
+          docker compose exec -T "$PHP_SVC" sh -lc "php -d display_errors=1 -d error_reporting=32767 '$INSTALLER' install \
             --db_hostname '$DB_HOST' \
             --db_username '$DB_USER' \
             --db_password '$DB_PASS' \
@@ -167,11 +195,11 @@ jobs:
             --username admin \
             --password admin123 \
             --email admin@example.com \
-            --http_server '${LOCAL_BASE_URL%/}/'" \
-          || { set +x; echo '::error::CLI install failed; recent container logs:'; docker compose logs --no-color --tail=300; exit 1; }
-          set +x
+            --http_server '${LOCAL_BASE_URL%/}/'"
 
+          echo "== Removing installer directory (if left behind) =="
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
+
 
       - name: Ensure default currency set (USD)
         shell: bash
