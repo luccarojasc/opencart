@@ -24,14 +24,21 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get -y install \
             apache2 mariadb-server unzip git rsync curl \
-            php php-cli php-common php-mysql php-gd php-curl php-zip php-xml php-mbstring
+            php php-cli php-common php-mysql php-gd php-curl php-zip php-xml php-mbstring \
+            libapache2-mod-php
           sudo a2enmod rewrite
+          PHPV="$(php -r 'echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION;')"
+          sudo a2enmod "php${PHPV}"
+          echo 'DirectoryIndex index.php index.html' | sudo tee /etc/apache2/conf-available/dirindex.conf >/dev/null
+          sudo a2enconf dirindex
           if command -v systemctl >/dev/null 2>&1; then
             sudo systemctl enable --now apache2
             sudo systemctl enable --now mariadb
+            sudo systemctl reload apache2
           else
             sudo service apache2 start
             sudo service mariadb start
+            sudo service apache2 reload
           fi
 
       - name: Reset MariaDB
