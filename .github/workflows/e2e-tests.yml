@@ -1,4 +1,4 @@
-name: testRigor E2E on OpenCart (localhost)
+name: OpenCart + testRigor E2E
 
 on:
   push:
@@ -6,253 +6,182 @@ on:
   workflow_dispatch:
 
 jobs:
-  e2e:
+  opencart_e2e:
     runs-on: ubuntu-latest
     env:
+      LOCAL_BASE_URL: http://localhost/
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
+      TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Start services (docker-compose)
-        run: |
-          docker compose -f docker-compose.yml up -d --build --remove-orphans --quiet-pull
-          docker compose ps
-
-      - name: Detect services and URL
+      - name: Install prerequisites
         shell: bash
         run: |
-          set -euo pipefail
-          WEB_SVC="apache"
-          PHP_SVC="php"
-          DB_SVC="mysql"
-
-          # Autodetect if names differ
-          if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
-            PHP_SVC=""
-            for s in $(docker compose ps --services); do
-              if docker compose exec -T "$s" sh -lc 'command -v php >/dev/null 2>&1' 2>/dev/null; then
-                PHP_SVC="$s"; break
-              fi
-            done
-          fi
-          if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
-            WEB_SVC="$(docker compose ps --services | head -n1)"
-          fi
-          if ! docker compose ps --services | grep -qx "$DB_SVC"; then
-            for s in $(docker compose ps --services); do
-              if docker compose exec -T "$s" sh -lc 'test -d /var/lib/mysql || test -d /bitnami/mariadb' >/dev/null 2>&1; then
-                DB_SVC="$s"; break
-              fi
-            done
-          fi
-          [ -z "$PHP_SVC" ] && { echo "::error::No container with PHP CLI found"; exit 1; }
-
-          echo "WEB_SVC=$WEB_SVC" >> "$GITHUB_ENV"
-          echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
-          echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
-
-          # Find installer
-          INSTALLER=""
-          for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
-            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
-          done
-          [ -z "$INSTALLER" ] && { echo "::error::Could not find upload/install/cli_install.php"; exit 1; }
-          echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
-
-          # Resolve URL
-          PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
-          if [ -z "$PORT" ]; then
-            PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
-          fi
-          if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
-            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -y install \
+            apache2 mariadb-server unzip git rsync curl \
+            php php-cli php-common php-mysql php-gd php-curl php-zip php-xml php-mbstring
+          sudo a2enmod rewrite
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl enable --now apache2
+            sudo systemctl enable --now mariadb
           else
-            echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
+            sudo service apache2 start
+            sudo service mariadb start
           fi
 
-      - name: Wait for DB to be ready
+      - name: Reset MariaDB
         shell: bash
         run: |
-          set -eo pipefail
-          : "${DB_SVC:=mysql}"
-          CID="$(docker compose ps -q "$DB_SVC")"
-          if [ -z "$CID" ]; then
-            echo "::error::Cannot find DB container for service '$DB_SVC'"; docker compose ps; exit 1
+          set -euxo pipefail
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl stop mariadb || true
+          else
+            sudo service mariadb stop || true
           fi
-          echo "Waiting for DB container ($DB_SVC) healthcheck…"
+          sudo rm -f /var/run/mysqld/mysqld.pid 2>/dev/null || true
+          sudo sed -i '/innodb_force_recovery/d' /etc/mysql/mariadb.conf.d/50-server.cnf 2>/dev/null || true
+          sudo rm -rf /var/lib/mysql/*
+          sudo mkdir -p /var/lib/mysql /var/run/mysqld
+          sudo chown -R mysql:mysql /var/lib/mysql /var/run/mysqld
+          if command -v mariadb-install-db >/dev/null 2>&1; then
+            sudo mariadb-install-db --no-defaults --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+          else
+            sudo mysql_install_db --no-defaults --user=mysql --basedir=/usr --datadir=/var/lib/mysql
+          fi
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl start mariadb
+            sudo systemctl enable mariadb || true
+          else
+            sudo service mariadb start
+          fi
+
+      - name: Create OpenCart database and users
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mysql <<'SQL'
+          CREATE DATABASE IF NOT EXISTS opencart CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+          CREATE USER IF NOT EXISTS 'oc_user'@'127.0.0.1' IDENTIFIED BY 'Password#123!';
+          CREATE USER IF NOT EXISTS 'oc_user'@'localhost' IDENTIFIED BY 'Password#123!';
+          GRANT ALL PRIVILEGES ON opencart.* TO 'oc_user'@'127.0.0.1';
+          GRANT ALL PRIVILEGES ON opencart.* TO 'oc_user'@'localhost';
+          FLUSH PRIVILEGES;
+          SQL
+          mysql -h 127.0.0.1 -P 3306 -u oc_user -p'Password#123!' opencart -N -e "SELECT 1;"
+
+      - name: Fetch OpenCart code and prepare configs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /var/www/opencart
+          sudo mkdir -p /var/www/opencart
+          rm -rf /tmp/opencart-src
+          git clone --depth=1 https://github.com/opencart/opencart.git /tmp/opencart-src
+          sudo rsync -a /tmp/opencart-src/upload/ /var/www/opencart/
+          cd /var/www/opencart
+          sudo cp config-dist.php config.php
+          sudo cp admin/config-dist.php admin/config.php
+          sudo chown -R www-data:www-data /var/www/opencart
+          find /var/www/opencart -type d -exec sudo chmod 755 {} \;
+          find /var/www/opencart -type f -exec sudo chmod 644 {} \;
+          sudo chmod 664 /var/www/opencart/config.php /var/www/opencart/admin/config.php
+
+      - name: Configure Apache VirtualHost
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo tee /etc/apache2/sites-available/opencart.conf >/dev/null <<'APACHE'
+          <VirtualHost *:80>
+            ServerName  _default_
+            DocumentRoot /var/www/opencart
+            <Directory /var/www/opencart>
+              AllowOverride All
+              Require all granted
+            </Directory>
+            ErrorLog ${APACHE_LOG_DIR}/opencart_error.log
+            CustomLog ${APACHE_LOG_DIR}/opencart_access.log combined
+          </VirtualHost>
+          APACHE
+          sudo a2dissite 000-default.conf 2>/dev/null || true
+          sudo a2ensite opencart.conf
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl reload apache2
+          else
+            sudo service apache2 reload
+          fi
+
+      - name: Install OpenCart via CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f /var/www/opencart/install/cli_install.php
+          sudo -u www-data php /var/www/opencart/install/cli_install.php install \
+            --db_hostname=127.0.0.1 \
+            --db_username=oc_user \
+            --db_password='Password#123!' \
+            --db_database=opencart \
+            --db_driver=mysqli \
+            --db_port=3306 \
+            --username=admin \
+            --password='Opencart123' \
+            --email='testing+opencart@testrigor.com' \
+            --http_server="${LOCAL_BASE_URL}"
+
+      - name: Remove OpenCart installer directory
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /var/www/opencart/install/
+          test ! -d /var/www/opencart/install
+
+      - name: Move storage outside webroot
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /var/storage_oc
+          sudo rsync -a /var/www/opencart/system/storage/ /var/storage_oc/
+          sudo chown -R www-data:www-data /var/storage_oc
+          sudo sed -i "s#^define('DIR_STORAGE'.*#define('DIR_STORAGE', '/var/storage_oc/');#g" /var/www/opencart/config.php
+          sudo sed -i "s#^define('DIR_STORAGE'.*#define('DIR_STORAGE', '/var/storage_oc/');#g" /var/www/opencart/admin/config.php
+
+      - name: Wait for site to be reachable
+        shell: bash
+        run: |
+          set -euxo pipefail
           for i in {1..60}; do
-            STATUS="$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo unknown)"
-            if [ "$STATUS" = "healthy" ]; then echo "DB is healthy."; break; fi
-            echo "DB health: $STATUS ($i/60)"; sleep 2
-            if [ "$i" -eq 60 ]; then
-              echo "::warning::Healthcheck not healthy after timeout; trying mysqladmin ping…"
-              docker compose exec -T "$DB_SVC" sh -lc \
-                "mysqladmin ping -h 127.0.0.1 --silent || \
-                 mysqladmin ping -h 127.0.0.1 -uroot --silent || \
-                 mysqladmin ping -h 127.0.0.1 -uroot -p\${MYSQL_ROOT_PASSWORD:-\${MARIADB_ROOT_PASSWORD:-}} --silent" \
-                || { echo '::error::DB did not respond to mysqladmin ping'; docker compose logs --no-color --tail=200 "$DB_SVC"; exit 1; }
-              break
+            if curl -fsS -o /dev/null -L "${LOCAL_BASE_URL}"; then
+              exit 0
             fi
+            sleep 2
           done
-
-      - name: Prepare config files & permissions (inside PHP container)
-        shell: bash
-        run: |
-          set -euo pipefail
-          : "${PHP_SVC:=php}"
-          docker compose exec -T "$PHP_SVC" sh -lc '
-            set -e
-            ROOT=""
-            for b in /var/www/html /var/www; do
-              if [ -f "$b/upload/config-dist.php" ]; then ROOT="$b"; break; fi
-            done
-            [ -z "$ROOT" ] && { echo "Cannot locate /var/www*/upload"; exit 1; }
-            cp -n "$ROOT/upload/config-dist.php" "$ROOT/upload/config.php" || true
-            cp -n "$ROOT/upload/admin/config-dist.php" "$ROOT/upload/admin/config.php" || true
-            chmod 666 "$ROOT/upload/config.php" "$ROOT/upload/admin/config.php" || true
-            chown -R www-data:www-data "$ROOT/upload" || true
-          '
-
-      - name: Install OpenCart via CLI (verbose & resilient)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          echo "Using PHP_SVC=$PHP_SVC  DB_SVC=$DB_SVC  LOCAL_BASE_URL=$LOCAL_BASE_URL"
-          echo "Installer path: $INSTALLER"
-
-          DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
-          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2- || true; }
-
-          DB_HOST="$DB_SVC"
-          DB_PORT="${DB_PORT:-3306}"
-          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
-          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
-          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
-          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
-          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
-          : "${DB_NAME:=opencart}"
-
-          trap '
-            echo "::group::PHP logs"; docker compose logs --no-color --tail=200 "$PHP_SVC" || true; echo "::endgroup::"
-            echo "::group::Apache logs"; docker compose logs --no-color --tail=200 apache || true; echo "::endgroup::"
-            echo "::group::DB logs"; docker compose logs --no-color --tail=200 "$DB_SVC" || true; echo "::endgroup::"
-          ' ERR
-
-          echo "== PHP modules =="
-          docker compose exec -T "$PHP_SVC" sh -lc 'php -v && php -m | sort | egrep -i "mysqli|pdo_mysql|curl|zip|gd|mbstring|xml" -n || true'
-
-          echo "== DB connectivity from PHP container =="
-          docker compose exec -T "$PHP_SVC" sh -lc "php -r '
-            \$m=new mysqli(\"$DB_HOST\",\"$DB_USER\",\"$DB_PASS\",\"$DB_NAME\",$DB_PORT);
-            if(\$m->connect_errno){fwrite(STDERR,\"mysqli connect failed: \".\$m->connect_error.\"\\n\"); exit(2);} echo \"mysqli ok\\n\"; \$m->close();
-          '"
-
-          echo "== Running installer =="
-          docker compose exec -T "$PHP_SVC" sh -lc "php -d display_errors=1 -d error_reporting=32767 '$INSTALLER' install \
-            --db_hostname '$DB_HOST' \
-            --db_username '$DB_USER' \
-            --db_password '$DB_PASS' \
-            --db_database '$DB_NAME' \
-            --db_driver mysqli \
-            --db_port '$DB_PORT' \
-            --username admin \
-            --password admin123 \
-            --email admin@example.com \
-            --http_server '${LOCAL_BASE_URL%/}/'"
-
-          docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
-
-      - name: Hard-disable PHP error display in OpenCart entrypoints
-        shell: bash
-        run: |
-          set -euo pipefail
-          : "${PHP_SVC:=php}"
-          docker compose exec -T "$PHP_SVC" bash -lc '
-            set -e
-            prepend_block="<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); ?>"
-            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
-              # storefront
-              if [ -f "$root/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/index.php"; then
-                printf "%s\n" "$prepend_block" | cat - "$root/index.php" > "$root/index.php.ci" && mv "$root/index.php.ci" "$root/index.php"
-              fi
-              # admin
-              if [ -f "$root/admin/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/admin/index.php"; then
-                printf "%s\n" "$prepend_block" | cat - "$root/admin/index.php" > "$root/admin/index.php.ci" && mv "$root/admin/index.php.ci" "$root/admin/index.php"
-              fi
-            done
-          '
-
-      - name: Ensure default currency set (USD) & disable OC error display
-        shell: bash
-        run: |
-          set -eo pipefail
-          : "${DB_SVC:=mysql}"
-          PREFIX="${DB_PREFIX:-oc_}"
-          DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
-          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2- || true; }
-
-          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
-          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)" || true
-          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)" || true
-          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)" || true
-          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)" || true
-          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
-          : "${DB_NAME:=opencart}"
-
-          READ_SQL="SELECT value FROM ${PREFIX}setting WHERE store_id=0 AND code='config' AND \`key\`='config_currency' LIMIT 1;"
-          VAL="$(docker compose exec -T "$DB_SVC" sh -lc \
-            "mysql -N -s -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$READ_SQL\"" || true)"
-          if [ -z "$VAL" ]; then
-            UPSERT_CCY="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
-                        VALUES (0,'config','config_currency','USD')
-                        ON DUPLICATE KEY UPDATE value='USD';"
-            docker compose exec -T "$DB_SVC" sh -lc \
-              "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
-          fi
-          UPSERT_ERRDISP="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
-                          VALUES (0,'config','config_error_display','0')
-                          ON DUPLICATE KEY UPDATE value='0';"
-          docker compose exec -T "$DB_SVC" sh -lc \
-            "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_ERRDISP\"" || true
-
-      - name: Wait for OpenCart to be reachable
-        shell: bash
-        run: |
-          set -e
-          for i in {1..90}; do
-            if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
-              echo "OpenCart is up at $LOCAL_BASE_URL"; exit 0
-            fi
-            echo "Waiting for OpenCart... ($i/90)"; sleep 3
-          done
-          echo "::group::Recent container logs"
-          docker compose logs --no-color --tail=300
-          echo "::endgroup::"
           exit 1
 
-      - name: Verify HTTP headers (sanity)
-        run: curl -LI "$LOCAL_BASE_URL" || true
-
-      - name: Setup Node.js (for testRigor CLI)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install testRigor CLI
+        shell: bash
         run: |
+          set -euxo pipefail
           npm i -g testrigor-cli
           testrigor --version || true
-          npx -y testrigor-cli --version || true
 
-      - name: Trigger testRigor suite against localhost
+      - name: Run testRigor suite against localhost
+        shell: bash
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
         run: |
-          echo "Suite ID: $TESTRIGOR_SUITE_ID"
-          echo "URL:      $LOCAL_BASE_URL"
-          npx -y testrigor-cli test-suite run "$TESTRIGOR_SUITE_ID" \
-            --token "$TESTRIGOR_CI_TOKEN" \
-            --localhost --url "$LOCAL_BASE_URL" \
+          set -euxo pipefail
+          echo "Suite ID: ${TESTRIGOR_SUITE_ID}"
+          echo "URL: ${LOCAL_BASE_URL}"
+          npx -y testrigor-cli test-suite run "${TESTRIGOR_SUITE_ID}" \
+            --token "${TESTRIGOR_CI_TOKEN}" \
+            --localhost --url "${LOCAL_BASE_URL}" \
             --verbose
