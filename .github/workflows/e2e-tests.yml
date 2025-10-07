@@ -200,6 +200,45 @@ jobs:
           echo "== Removing installer directory (if left behind) =="
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
+
+      - name: Ensure default currency set (USD) if missing
+        shell: bash
+        run: |
+          set -eo pipefail
+          : "${DB_SVC:=mysql}"
+          PREFIX="${DB_PREFIX:-oc_}"
+
+          # Read DB envs (don’t fail if any are missing)
+          DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
+          getv() { echo "$DB_ENV" | grep -E "^$1=" | head -n1 | cut -d= -f2- || true; }
+
+          DB_HOST="$DB_SVC"
+          DB_PORT="${DB_PORT:-3306}"
+          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)" || true
+          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)" || true
+          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)" || true
+          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)" || true
+          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
+          : "${DB_NAME:=opencart}"
+
+          # If setting exists, skip; otherwise insert USD
+          READ_SQL="SELECT value FROM ${PREFIX}setting
+                    WHERE store_id=0 AND code='config' AND \`key\`='config_currency' LIMIT 1;"
+          VAL="$(docker compose exec -T "$DB_SVC" sh -lc \
+            "mysql -N -s -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$READ_SQL\"" || true)"
+
+          if [ -n "$VAL" ]; then
+            echo "config_currency already set to: $VAL"
+          else
+            echo "config_currency missing; setting to USD"
+            UPSERT_SQL="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
+                        VALUES (0,'config','config_currency','USD')
+                        ON DUPLICATE KEY UPDATE value='USD';"
+            docker compose exec -T "$DB_SVC" sh -lc \
+              "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_SQL\"" || true
+          fi
+
+
       - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
