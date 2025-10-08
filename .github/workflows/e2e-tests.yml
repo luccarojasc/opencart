@@ -124,56 +124,49 @@ jobs:
             sudo service apache2 reload
           fi
 
-      - name: Install OpenCart via CLI (with logs)
+      - name: Manual finalize OpenCart (write configs + import schema)
         shell: bash
         run: |
           set -euxo pipefail
-          test -f /var/www/opencart/install/cli_install.php
-          sudo -u www-data php /var/www/opencart/install/cli_install.php install \
-            --db-hostname=127.0.0.1   --db_hostname=127.0.0.1 \
-            --db-username=oc_user     --db_username=oc_user \
-            --db-password='Password#123!' --db_password='Password#123!' \
-            --db-database=opencart    --db_database=opencart \
-            --db-driver=mysqli        --db_driver=mysqli \
-            --db-port=3306            --db_port=3306 \
-            --username=admin \
-            --password='Opencart123' \
-            --email='testing+opencart@testrigor.com' \
-            --http-server="${LOCAL_BASE_URL}" --http_server="${LOCAL_BASE_URL}" \
-            | tee /tmp/oc_cli_install.log || true
-          tail -n 200 /tmp/oc_cli_install.log || true
+          BASE="/var/www/opencart"
+          sudo sed -i \
+            -e "s#^define('HTTP_SERVER'.*#define('HTTP_SERVER', '${LOCAL_BASE_URL}');#g" \
+            -e "s#^define('HTTP_CATALOG'.*#define('HTTP_CATALOG', '${LOCAL_BASE_URL}');#g" \
+            -e "s#^define('DIR_APPLICATION'.*#define('DIR_APPLICATION', '${BASE}/catalog/');#g" \
+            -e "s#^define('DIR_SYSTEM'.*#define('DIR_SYSTEM', '${BASE}/system/');#g" \
+            -e "s#^define('DIR_IMAGE'.*#define('DIR_IMAGE', '${BASE}/image/');#g" \
+            -e "s#^define('DB_DRIVER'.*#define('DB_DRIVER', 'mysqli');#g" \
+            -e "s#^define('DB_HOSTNAME'.*#define('DB_HOSTNAME', '127.0.0.1');#g" \
+            -e "s#^define('DB_USERNAME'.*#define('DB_USERNAME', 'oc_user');#g" \
+            -e "s#^define('DB_PASSWORD'.*#define('DB_PASSWORD', 'Password#123!');#g" \
+            -e "s#^define('DB_DATABASE'.*#define('DB_DATABASE', 'opencart');#g" \
+            -e "s#^define('DB_PORT'.*#define('DB_PORT', '3306');#g" \
+            -e "s#^define('DB_PREFIX'.*#define('DB_PREFIX', 'oc_');#g" \
+            "${BASE}/config.php"
 
-      - name: Verify OpenCart installation
-        shell: bash
-        run: |
-          set -euxo pipefail
-          HAS_DIR_APP="$(php -r "(@include '/var/www/opencart/config.php'); echo defined('DIR_APPLICATION') ? 'yes' : 'no';")"
-          TABLES="$(mysql -h 127.0.0.1 -u oc_user -p'Password#123!' -D opencart -N -e "SHOW TABLES LIKE 'oc\_%';" | wc -l || true)"
-          echo "DIR_APPLICATION defined: $HAS_DIR_APP"
-          echo "oc_% tables count: $TABLES"
-          if [ "$HAS_DIR_APP" != "yes" ] || [ "${TABLES:-0}" -lt 10 ]; then
-            sudo -u www-data php /var/www/opencart/install/cli_install.php install \
-              --db-hostname=127.0.0.1   --db_hostname=127.0.0.1 \
-              --db-username=oc_user     --db_username=oc_user \
-              --db-password='Password#123!' --db_password='Password#123!' \
-              --db-database=opencart    --db_database=opencart \
-              --db-driver=mysqli        --db_driver=mysqli \
-              --db-port=3306            --db_port=3306 \
-              --username=admin \
-              --password='Opencart123' \
-              --email='testing+opencart@testrigor.com' \
-              --http-server="${LOCAL_BASE_URL}" --http_server="${LOCAL_BASE_URL}" \
-              | tee -a /tmp/oc_cli_install.log || true
-            HAS_DIR_APP="$(php -r "(@include '/var/www/opencart/config.php'); echo defined('DIR_APPLICATION') ? 'yes' : 'no';")"
-            TABLES="$(mysql -h 127.0.0.1 -u oc_user -p'Password#123!' -D opencart -N -e "SHOW TABLES LIKE 'oc\_%';" | wc -l || true)"
+          sudo sed -i \
+            -e "s#^define('HTTP_SERVER'.*#define('HTTP_SERVER', '${LOCAL_BASE_URL}admin/');#g" \
+            -e "s#^define('HTTP_CATALOG'.*#define('HTTP_CATALOG', '${LOCAL_BASE_URL}');#g" \
+            -e "s#^define('DIR_APPLICATION'.*#define('DIR_APPLICATION', '${BASE}/admin/');#g" \
+            -e "s#^define('DIR_SYSTEM'.*#define('DIR_SYSTEM', '${BASE}/system/');#g" \
+            -e "s#^define('DIR_IMAGE'.*#define('DIR_IMAGE', '${BASE}/image/');#g" \
+            -e "s#^define('DB_DRIVER'.*#define('DB_DRIVER', 'mysqli');#g" \
+            -e "s#^define('DB_HOSTNAME'.*#define('DB_HOSTNAME', '127.0.0.1');#g" \
+            -e "s#^define('DB_USERNAME'.*#define('DB_USERNAME', 'oc_user');#g" \
+            -e "s#^define('DB_PASSWORD'.*#define('DB_PASSWORD', 'Password#123!');#g" \
+            -e "s#^define('DB_DATABASE'.*#define('DB_DATABASE', 'opencart');#g" \
+            -e "s#^define('DB_PORT'.*#define('DB_PORT', '3306');#g" \
+            -e "s#^define('DB_PREFIX'.*#define('DB_PREFIX', 'oc_');#g" \
+            "${BASE}/admin/config.php"
+
+          SQL_FILE="${BASE}/install/opencart.sql"
+          if [ -f "${SQL_FILE}" ]; then
+            mysql -h 127.0.0.1 -u oc_user -p'Password#123!' opencart < "${SQL_FILE}"
           fi
-          if [ "$HAS_DIR_APP" != "yes" ] || [ "${TABLES:-0}" -lt 10 ]; then
-            echo "OpenCart CLI install still incomplete."
-            head -n 60 /var/www/opencart/config.php || true
-            head -n 60 /var/www/opencart/admin/config.php || true
-            sudo tail -n 200 /var/log/apache2/error.log || true
-            exit 1
-          fi
+
+          mysql -h 127.0.0.1 -u oc_user -p'Password#123!' opencart -e "
+            UPDATE oc_setting SET value='${LOCAL_BASE_URL}' WHERE \`key\` IN ('config_url','config_ssl');
+          " || true
 
       - name: Remove OpenCart installer directory
         shell: bash
@@ -191,6 +184,22 @@ jobs:
           sudo chown -R www-data:www-data /var/storage_oc
           sudo sed -i "s#^define('DIR_STORAGE'.*#define('DIR_STORAGE', '/var/storage_oc/');#g" /var/www/opencart/config.php
           sudo sed -i "s#^define('DIR_STORAGE'.*#define('DIR_STORAGE', '/var/storage_oc/');#g" /var/www/opencart/admin/config.php
+
+      - name: Verify install (config + schema)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          HAS_DIR_APP="$(php -r "(@include '/var/www/opencart/config.php'); echo defined('DIR_APPLICATION') ? 'yes' : 'no';")"
+          TABLES="$(mysql -h 127.0.0.1 -u oc_user -p'Password#123!' -D opencart -N -e "SHOW TABLES LIKE 'oc\_%';" | wc -l || true)"
+          echo "DIR_APPLICATION defined: $HAS_DIR_APP"
+          echo "oc_% tables count: $TABLES"
+          if [ "$HAS_DIR_APP" != "yes" ] || [ "${TABLES:-0}" -lt 10 ]; then
+            echo "Installation looks incomplete."
+            head -n 60 /var/www/opencart/config.php || true
+            head -n 60 /var/www/opencart/admin/config.php || true
+            sudo tail -n 200 /var/log/apache2/error.log || true
+            exit 1
+          fi
 
       - name: Wait for site to be reachable
         shell: bash
