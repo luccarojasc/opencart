@@ -28,7 +28,7 @@ jobs:
           PHP_SVC="php"
           DB_SVC="mysql"
 
-          # Autodetect service names if they differ
+          # Autodetect PHP container if named differently
           if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
             PHP_SVC=""
             for s in $(docker compose ps --services); do
@@ -37,6 +37,7 @@ jobs:
               fi
             done
           fi
+          # Autodetect web and db if necessary
           if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose ps --services | head -n1)"
           fi
@@ -53,14 +54,14 @@ jobs:
           echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
           echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
 
-          # Try to locate CLI installer (optional in some images)
+          # Optional CLI installer path
           INSTALLER=""
           for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
             if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
           done
           echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
 
-          # Pick published port
+          # Local URL (published port)
           PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           [ -z "$PORT" ] && PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
@@ -91,7 +92,7 @@ jobs:
             fi
           done
 
-      - name: Prepare config files & permissions (inside PHP container)
+      - name: Prepare config files & permissions
         shell: bash
         run: |
           set -euo pipefail
@@ -138,7 +139,7 @@ jobs:
 
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
-      - name: Manual finalize OpenCart (write configs)
+      - name: Finalize configs via small PHP script
         shell: bash
         run: |
           set -euo pipefail
@@ -165,25 +166,39 @@ jobs:
             BASE="$ROOT/upload"
             CFG_APP="$BASE/config.php"
             CFG_ADM="$BASE/admin/config.php"
-            update_cfg() {
-              local file="$1"
-              sed -i \
-                -e "s|define('\''HTTP_SERVER'\''.*|define('\''HTTP_SERVER'\'', '\''${LOCAL_BASE_URL%/}/'\'');|" \
-                -e "s|define('\''HTTP_CATALOG'\''.*|define('\''HTTP_CATALOG'\'', '\''${LOCAL_BASE_URL%/}/'\'');|" \
-                -e "s|define('\''DIR_APPLICATION'\''.*|define('\''DIR_APPLICATION'\'', '\''$BASE/catalog/'\'');|" \
-                -e "s|define('\''DIR_SYSTEM'\''.*|define('\''DIR_SYSTEM'\'', '\''$BASE/system/'\'');|" \
-                -e "s|define('\''DIR_IMAGE'\''.*|define('\''DIR_IMAGE'\'', '\''$BASE/image/'\'');|" \
-                -e "s|define('\''DB_DRIVER'\''.*|define('\''DB_DRIVER'\'', '\''mysqli'\'');|" \
-                -e "s|define('\''DB_HOSTNAME'\''.*|define('\''DB_HOSTNAME'\'', '\''$DB_HOST'\'');|" \
-                -e "s|define('\''DB_USERNAME'\''.*|define('\''DB_USERNAME'\'', '\''$DB_USER'\'');|" \
-                -e "s|define('\''DB_PASSWORD'\''.*|define('\''DB_PASSWORD'\'', '\''$DB_PASS'\'');|" \
-                -e "s|define('\''DB_DATABASE'\''.*|define('\''DB_DATABASE'\'', '\''$DB_NAME'\'');|" \
-                -e "s|define('\''DB_PORT'\''.*|define('\''DB_PORT'\'', '\''$DB_PORT'\'');|" \
-                -e "s|define('\''DB_PREFIX'\''.*|define('\''DB_PREFIX'\'', '\''oc_'\'' );|" \
-                "$file"
-            }
-            [ -f "$CFG_APP" ] && update_cfg "$CFG_APP" || true
-            [ -f "$CFG_ADM" ] && update_cfg "$CFG_ADM" || true
+
+            cat > /tmp/fix_cfg.php <<PHP
+<?php
+function setdef(\$c,\$k,\$v){return preg_replace("/define\\('".\$k."',\\s*'[^']*'\\);/","define('".\$k."', '".\$v."');",\$c);}
+\$vars = [
+  'http' => getenv('LOCAL_BASE_URL'),
+  'base' => \$BASE = '$BASE',
+  'db_host' => getenv('DB_HOST'),
+  'db_user' => getenv('DB_USER'),
+  'db_pass' => getenv('DB_PASS'),
+  'db_name' => getenv('DB_NAME'),
+  'db_port' => getenv('DB_PORT'),
+];
+foreach (['$CFG_APP', '$CFG_ADM'] as \$cfg) {
+  if (!is_file(\$cfg)) continue;
+  \$c = file_get_contents(\$cfg);
+  \$c = setdef(\$c,'HTTP_SERVER',\$vars['http'].'/');
+  \$c = setdef(\$c,'HTTP_CATALOG',\$vars['http'].'/');
+  \$c = setdef(\$c,'DIR_APPLICATION',\$vars['base'].'/catalog/');
+  \$c = setdef(\$c,'DIR_SYSTEM',\$vars['base'].'/system/');
+  \$c = setdef(\$c,'DIR_IMAGE',\$vars['base'].'/image/');
+  \$c = setdef(\$c,'DB_DRIVER','mysqli');
+  \$c = setdef(\$c,'DB_HOSTNAME',\$vars['db_host']);
+  \$c = setdef(\$c,'DB_USERNAME',\$vars['db_user']);
+  \$c = setdef(\$c,'DB_PASSWORD',\$vars['db_pass']);
+  \$c = setdef(\$c,'DB_DATABASE',\$vars['db_name']);
+  \$c = setdef(\$c,'DB_PORT',\$vars['db_port']);
+  \$c = setdef(\$c,'DB_PREFIX','oc_');
+  file_put_contents(\$cfg,\$c);
+  echo "Updated ", \$cfg, PHP_EOL;
+}
+PHP
+            php /tmp/fix_cfg.php
           '
 
       - name: Silence PHP notices globally (.user.ini)
@@ -244,7 +259,7 @@ foreach ($files as $f) {
     $c, -1, $n
   );
   file_put_contents($f, $c);
-  echo $f, ": ", $n, " replacements\n";
+  echo $f, ': ', $n, \" replacements\\n\";
 }
 PHP
             php /tmp/currency_fallback_patch.php
