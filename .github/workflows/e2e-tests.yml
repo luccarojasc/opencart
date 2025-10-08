@@ -186,23 +186,6 @@ jobs:
             [ -f "$CFG_ADM" ] && update_cfg "$CFG_ADM" || true
           '
 
-      - name: Hard-disable PHP error display in entrypoints
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose exec -T "$PHP_SVC" bash -lc '
-            set -e
-            prepend="<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(EALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); ?>"
-            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
-              if [ -f "$root/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/index.php"; then
-                printf "%s\n" "$prepend" | cat - "$root/index.php" > "$root/index.php.ci" && mv "$root/index.php.ci" "$root/index.php"
-              fi
-              if [ -f "$root/admin/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/admin/index.php"; then
-                printf "%s\n" "$prepend" | cat - "$root/admin/index.php" > "$root/admin/index.php.ci" && mv "$root/admin/index.php.ci" "$root/admin/index.php"
-              fi
-            done
-          '
-
       - name: Silence PHP notices globally (.user.ini)
         shell: bash
         run: |
