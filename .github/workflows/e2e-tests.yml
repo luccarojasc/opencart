@@ -226,6 +226,8 @@ jobs:
         run: |
           set -euo pipefail
           PREFIX="${DB_PREFIX:-oc_}"
+
+          # Gather DB connection values from the DB container env
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
           DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
@@ -236,16 +238,23 @@ jobs:
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
 
-          # Ensure tables exist
+          # Detect a SQL client inside the DB container (mysql or mariadb)
+          DB_CLI="$(docker compose exec -T "$DB_SVC" sh -lc 'if command -v mysql >/dev/null 2>&1; then echo mysql; elif command -v mariadb >/dev/null 2>&1; then echo mariadb; else echo ""; fi')"
+          if [ -z "$DB_CLI" ]; then
+            echo "::error::No mysql/mariadb client found in DB container '$DB_SVC'."; docker compose exec -T "$DB_SVC" sh -lc 'ls -l /usr/bin /usr/local/bin || true'; exit 1
+          fi
+          echo "Using DB client: $DB_CLI"
+
+          # Ensure tables exist (fail early with a clear message)
           docker compose exec -T "$DB_SVC" sh -lc \
-            "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"SHOW TABLES LIKE '${PREFIX}setting'\" | grep -q ${PREFIX}setting" \
+            "$DB_CLI -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"SHOW TABLES LIKE '${PREFIX}setting'\" | grep -q ${PREFIX}setting" \
             || { echo '::error::OpenCart tables missing. Ensure the installer step ran.'; exit 1; }
 
           UPSERT_CCY="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
                       VALUES (0,'config','config_currency','USD')
                       ON DUPLICATE KEY UPDATE value='USD';"
           docker compose exec -T "$DB_SVC" sh -lc \
-            "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
+            "$DB_CLI -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\""
 
       - name: Patch currency reads with default fallback
         shell: bash
