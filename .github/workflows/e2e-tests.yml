@@ -130,17 +130,17 @@ jobs:
           set -euxo pipefail
           test -f /var/www/opencart/install/cli_install.php
           sudo -u www-data php /var/www/opencart/install/cli_install.php install \
-            --db_hostname=127.0.0.1 \
-            --db_username=oc_user \
-            --db_password='Password#123!' \
-            --db_database=opencart \
-            --db_driver=mysqli \
-            --db_port=3306 \
+            --db-hostname=127.0.0.1   --db_hostname=127.0.0.1 \
+            --db-username=oc_user     --db_username=oc_user \
+            --db-password='Password#123!' --db_password='Password#123!' \
+            --db-database=opencart    --db_database=opencart \
+            --db-driver=mysqli        --db_driver=mysqli \
+            --db-port=3306            --db_port=3306 \
             --username=admin \
             --password='Opencart123' \
             --email='testing+opencart@testrigor.com' \
-            --http_server="${LOCAL_BASE_URL}" | tee /tmp/oc_cli_install.log || true
-          echo "CLI output (last 200 lines):"
+            --http-server="${LOCAL_BASE_URL}" --http_server="${LOCAL_BASE_URL}" \
+            | tee /tmp/oc_cli_install.log || true
           tail -n 200 /tmp/oc_cli_install.log || true
 
       - name: Verify OpenCart installation
@@ -152,28 +152,25 @@ jobs:
           echo "DIR_APPLICATION defined: $HAS_DIR_APP"
           echo "oc_% tables count: $TABLES"
           if [ "$HAS_DIR_APP" != "yes" ] || [ "${TABLES:-0}" -lt 10 ]; then
-            echo "First install attempt seems incomplete. Retrying CLI once..."
             sudo -u www-data php /var/www/opencart/install/cli_install.php install \
-              --db_hostname=127.0.0.1 \
-              --db_username=oc_user \
-              --db_password='Password#123!' \
-              --db_database=opencart \
-              --db_driver=mysqli \
-              --db_port=3306 \
+              --db-hostname=127.0.0.1   --db_hostname=127.0.0.1 \
+              --db-username=oc_user     --db_username=oc_user \
+              --db-password='Password#123!' --db_password='Password#123!' \
+              --db-database=opencart    --db_database=opencart \
+              --db-driver=mysqli        --db_driver=mysqli \
+              --db-port=3306            --db_port=3306 \
               --username=admin \
               --password='Opencart123' \
               --email='testing+opencart@testrigor.com' \
-              --http_server="${LOCAL_BASE_URL}" | tee -a /tmp/oc_cli_install.log || true
+              --http-server="${LOCAL_BASE_URL}" --http_server="${LOCAL_BASE_URL}" \
+              | tee -a /tmp/oc_cli_install.log || true
             HAS_DIR_APP="$(php -r "(@include '/var/www/opencart/config.php'); echo defined('DIR_APPLICATION') ? 'yes' : 'no';")"
             TABLES="$(mysql -h 127.0.0.1 -u oc_user -p'Password#123!' -D opencart -N -e "SHOW TABLES LIKE 'oc\_%';" | wc -l || true)"
           fi
           if [ "$HAS_DIR_APP" != "yes" ] || [ "${TABLES:-0}" -lt 10 ]; then
             echo "OpenCart CLI install still incomplete."
-            echo "config.php head:"
             head -n 60 /var/www/opencart/config.php || true
-            echo "admin/config.php head:"
             head -n 60 /var/www/opencart/admin/config.php || true
-            echo "Apache error log tail:"
             sudo tail -n 200 /var/log/apache2/error.log || true
             exit 1
           fi
@@ -215,9 +212,7 @@ jobs:
             done
             sleep 2
           done
-          echo "Failed to reach any URL after 120s. Last headers for /:"
           curl -I "${LOCAL_BASE_URL}" || true
-          echo "Apache error log tail:"
           sudo tail -n 200 /var/log/apache2/error.log || true
           exit 1
 
