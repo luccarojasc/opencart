@@ -196,10 +196,10 @@ jobs:
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               [ -d "$root" ] || continue
               cat > "$root/.user.ini" <<'"'"'INI'"'"'
-display_errors = 0
-display_startup_errors = 0
-error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
-INI
+          display_errors = 0
+          display_startup_errors = 0
+          error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
+          INI
               echo "Wrote $root/.user.ini"
             done
           '
