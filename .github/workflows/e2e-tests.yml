@@ -155,7 +155,7 @@ jobs:
           : "${DB_NAME:=opencart}"
           docker compose exec -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
                               -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
-                              -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB_PASS="$DB_PASS" \
+                              -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB PASS="$DB_PASS" \
                               -T "$PHP_SVC" bash -lc '
             set -e
             ROOT=""
@@ -187,7 +187,7 @@ jobs:
             [ -f "$CFG_ADM" ] && update_cfg "$CFG_ADM" || true
           '
 
-      # Global suppression so notices never render as a blank page
+      # Global suppression so notices never render as a blank page (FPM honors .user.ini)
       - name: Silence PHP notices globally (.user.ini)
         shell: bash
         run: |
@@ -201,6 +201,19 @@ jobs:
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
           INI
               echo "Wrote $root/.user.ini"
+            done
+          '
+
+      # Fallback for stacks that ignore .user.ini (edit index.php first line)
+      - name: Force disable display_errors in entrypoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose exec -T "$PHP_SVC" bash -lc '
+            for idx in /var/www/html/upload/index.php /var/www/upload/index.php /var/www/html/upload/admin/index.php /var/www/upload/admin/index.php; do
+              [ -f "$idx" ] || continue
+              sed -i "1s|<?php|<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); |" "$idx"
+              head -n 1 "$idx"
             done
           '
 
@@ -224,18 +237,19 @@ jobs:
           docker compose exec -T "$DB_SVC" sh -lc \
             "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
 
-      # Robust patch (single-quoted remote script prevents $this expansion)
+      # Robust patch (matches ['currency'] OR ["currency"], with optional whitespace)
       - name: Patch currency reads with default fallback
         shell: bash
         run: |
           set -euo pipefail
+          # IMPORTANT: single-quoted remote command prevents the host shell from expanding $this
           docker compose exec -T "$PHP_SVC" bash -lc '
             set -e
             for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do
               [ -f "$f" ] || continue
-              sed -i -E '"'"'s/\$this->session->data\[["'\''"]currency["'\''"]\]/(\$this->session->data['\''currency'\''] ?? \$this->config->get('\''config_currency'\''))/g'"'"' "$f"
+              sed -i -r "s/\$this->session->data[[:space:]]*\[[[:space:]]*['\""]currency['\""][[:space:]]*\]/(\$this->session->data['\"'\"'currency'\"'\"'] ?? \$this->config->get('\"'\"'config_currency'\"'\"'))/g" "$f"
               echo "Patched: $f"
-              grep -n '"'"'config->get('\''config_currency'\'')'"'"' "$f" || true
+              grep -n "config->get('config_currency')" "$f" || true
             done
           '
 
