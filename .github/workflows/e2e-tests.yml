@@ -153,10 +153,12 @@ jobs:
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
-          docker compose exec -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
-                              -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
-                              -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB PASS="$DB_PASS" \
-                              -T "$PHP_SVC" bash -lc '
+
+          docker compose exec \
+            -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
+            -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
+            -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB_PASS="$DB_PASS" \
+            -T "$PHP_SVC" bash -lc '
             set -e
             ROOT=""
             for b in /var/www/html /var/www; do
@@ -242,12 +244,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # IMPORTANT: single-quoted remote command prevents the host shell from expanding $this
+          # Single-quoted remote block prevents the host shell from expanding $this
           docker compose exec -T "$PHP_SVC" bash -lc '
             set -e
             for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do
               [ -f "$f" ] || continue
-              sed -i -r "s/\$this->session->data[[:space:]]*\[[[:space:]]*['\""]currency['\""][[:space:]]*\]/(\$this->session->data['\"'\"'currency'\"'\"'] ?? \$this->config->get('\"'\"'config_currency'\"'\"'))/g" "$f"
+              sed -i -r "s/\$this->session->data[[:space:]]*\[[[:space:]]*['\""]currency['\""][[:space:]]*\]/(\$this->session->data['currency'] ?? \$this->config->get('config_currency'))/g" "$f"
               echo "Patched: $f"
               grep -n "config->get('config_currency')" "$f" || true
             done
