@@ -140,6 +140,7 @@ jobs:
             --http_server '${LOCAL_BASE_URL%/}/'"
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
+      # Replaced sed-heavy step with a safe PHP-based rewriter to avoid quoting issues
       - name: Finalize base URLs and DB settings in configs
         shell: bash
         run: |
@@ -158,28 +159,37 @@ jobs:
             -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
             -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
             -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB_PASS="$DB_PASS" \
-            -T "$PHP_SVC" bash -lc '
-            set -e
-            ROOT=""
-            for b in /var/www/html /var/www; do
-              if [ -d "$b/upload" ]; then ROOT="$b"; break; fi
-            done
-            [ -z "$ROOT" ] && exit 0
-            BASE="$ROOT/upload"
-            CFG_APP="$BASE/config.php"
-            CFG_ADM="$BASE/admin/config.php"
-            update_cfg() {
-              local file="$1"
-              sed -i \
-                -e "s|define('\''HTTP_SERVER'\''.*|define('\''HTTP_SERVER'\'', '\''${LOCAL_BASE_URL%/}/'\'');|" \
-                -e "s|define('\''HTTP_CATALOG'\''.*|define('\''HTTP_CATALOG'\'', '\''${LOCAL_BASE_URL%/}/'\'');|" \
-                -e "s|define('\''DIR_APPLICATION'\''.*|define('\''DIR_APPLICATION'\'', '\''$BASE/catalog/'\'');|" \
-                -e "s|define('\''DIR_SYSTEM'\''.*|define('\''DIR_SYSTEM'\'', '\''$BASE/system/'\'');|" \
-                -e "s|define('\''DIR_IMAGE'\''.*|define('\''DIR_IMAGE'\'', '\''$BASE/image/'\'');|" \
-                -e "s|define('\''DB_DRIVER'\''.*|define('\''DB_DRIVER'\'', '\''mysqli'\'');|" \
-                -e "s|define('\''DB_HOSTNAME'\''.*|define('\''DB_HOSTNAME'\'', '\''$DB_HOST'\'');|" \
-                -e "s|define('\''DB_USERNAME'\''.*|define('\''DB_USERNAME'\'', '\''$DB_USER'\'');|" \
-                -e "s|define('\''DB_PASSWORD'\''.*|define('\''DB_PASSWORD'\'', '\''$DB_PASS'\'');|" \
-                -e "s|define('\''DB_DATABASE'\''.*|define('\''DB_DATABASE'\'', '\''$DB_NAME'\'');|" \
-                -e "s|define('\''DB_PORT'\''.*|define('\''DB_PORT'\'', '\''$DB_PORT'\'');|" \
-                -e "s|define('\''DB_PREFIX'\''.*|define('\''DB_PREFIX'\'', '\''oc_'\'' )*_
+            -T "$PHP_SVC" bash -lc 'cat > /tmp/oc_cfg_patch.php <<'\''PHP'\'' 
+          <?php
+          $base = null;
+          foreach ([ "/var/www/html/upload", "/var/www/upload" ] as $b) {
+            if (is_dir($b)) { $base = $b; break; }
+          }
+          if (!$base) { exit(0); }
+
+          $cfgApp = "$base/config.php";
+          $cfgAdm = "$base/admin/config.php";
+
+          $http = rtrim(getenv("LOCAL_BASE_URL") ?: "http://localhost", "/") . "/";
+          $db = [
+            "host" => getenv("DB_HOST") ?: "localhost",
+            "port" => getenv("DB_PORT") ?: "3306",
+            "name" => getenv("DB_NAME") ?: "opencart",
+            "user" => getenv("DB_USER") ?: "root",
+            "pass" => getenv("DB_PASS") ?: "",
+          ];
+
+          function rewriteCfg($file, $base, $http, $db) {
+            if (!is_file($file)) return;
+            $c = file_get_contents($file);
+
+            $map = [
+              "/define\\('HTTP_SERVER'.*/"     => "define('HTTP_SERVER', '$http');",
+              "/define\\('HTTP_CATALOG'.*/"    => "define('HTTP_CATALOG', '$http');",
+              "/define\\('DIR_APPLICATION'.*/" => "define('DIR_APPLICATION', '$base/catalog/');",
+              "/define\\('DIR_SYSTEM'.*/"      => "define('DIR_SYSTEM', '$base/system/');",
+              "/define\\('DIR_IMAGE'.*/"       => "define('DIR_IMAGE', '$base/image/');",
+              "/define\\('DB_DRIVER'.*/"       => "define('DB_DRIVER', 'mysqli');",
+              "/define\\('DB_HOSTNAME'.*/"     => "define('DB_HOSTNAME', '{$db['host']}');",
+              "/define\\('DB_USERNAME'.*/"     => "define('DB_USERNAME', '{$db['user']}');",
+              "/define\\('DB_PASSWORD'.*/"     => "define
