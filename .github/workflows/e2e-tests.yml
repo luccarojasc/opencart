@@ -192,7 +192,7 @@ jobs:
           set -euo pipefail
           docker compose exec -T "$PHP_SVC" bash -lc '
             set -e
-            prepend="<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); ?>"
+            prepend="<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(EALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); ?>"
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               if [ -f "$root/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/index.php"; then
                 printf "%s\n" "$prepend" | cat - "$root/index.php" > "$root/index.php.ci" && mv "$root/index.php.ci" "$root/index.php"
@@ -200,6 +200,22 @@ jobs:
               if [ -f "$root/admin/index.php" ] && ! grep -q "ini_set('\''display_errors'\''" "$root/admin/index.php"; then
                 printf "%s\n" "$prepend" | cat - "$root/admin/index.php" > "$root/admin/index.php.ci" && mv "$root/admin/index.php.ci" "$root/admin/index.php"
               fi
+            done
+          '
+
+      - name: Silence PHP notices globally (.user.ini)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose exec -T "$PHP_SVC" bash -lc '
+            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
+              [ -d "$root" ] || continue
+              cat > "$root/.user.ini" <<EOF
+display_errors = 0
+display_startup_errors = 0
+error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
+EOF
+              echo "Wrote $root/.user.ini"
             done
           '
 
@@ -224,23 +240,35 @@ jobs:
           docker compose exec -T "$DB_SVC" sh -lc \
             "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
 
-      - name: "Patch OC controllers: fallback to default currency if session key is missing"
+      - name: Patch currency reads with default fallback
         shell: bash
         run: |
           set -euo pipefail
           docker compose exec -T "$PHP_SVC" bash -lc '
             set -e
-            for f in \
-              /var/www/html/upload/catalog/controller/product/thumb.php \
-              /var/www/upload/catalog/controller/product/thumb.php; do
+            cat > /tmp/currency_fallback_patch.php << "PHP"
+<?php
+$files = [
+  "/var/www/html/upload/catalog/controller/product/thumb.php",
+  "/var/www/upload/catalog/controller/product/thumb.php",
+];
+foreach ($files as $f) {
+  if (!is_file($f)) continue;
+  $c = file_get_contents($f);
+  $c = preg_replace(
+    "/\\$this->session->data\\[['\\\"]currency['\\\"]\\]/",
+    "(\$this->session->data['currency'] ?? \$this->config->get('config_currency'))",
+    $c, -1, $n
+  );
+  file_put_contents($f, $c);
+  echo $f, ": ", $n, " replacements\n";
+}
+PHP
+            php /tmp/currency_fallback_patch.php
+            for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do
               [ -f "$f" ] || continue
-              # add a patch marker at top (once)
-              if ! grep -q "OC_CURRENCY_FALLBACK_PATCH" "$f"; then
-                printf "%s\n" "<?php /* OC_CURRENCY_FALLBACK_PATCH */ ?>" | cat - "$f" > "$f.ci" && mv "$f.ci" "$f"
-              fi
-              # replace session reads with fallback to config currency
-              sed -i "s/\$this->session->data\['currency'\]/(\$this->session->data['currency'] ?? \$this->config->get('config_currency'))/g" "$f"
-              echo "Patched $f"
+              echo "Remaining currency reads in $f:"
+              grep -n "session->data.*currency" "$f" || true
             done
           '
 
