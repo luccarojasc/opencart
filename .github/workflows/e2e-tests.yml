@@ -224,19 +224,20 @@ jobs:
           docker compose exec -T "$DB_SVC" sh -lc \
             "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
 
-      # Robust patch (no heredoc; single sed -E handles both 'currency' and "currency")
+      # Robust patch (single-quoted remote script prevents $this expansion)
       - name: Patch currency reads with default fallback
         shell: bash
         run: |
           set -euo pipefail
-          docker compose exec -T "$PHP_SVC" bash -lc " \
-            for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do \
-              [ -f \"\$f\" ] || continue; \
-              sed -i -E \"s/\\$this->session->data\\[['\\\"]currency['\\\"]\\]/(\\$this->session->data['currency'] ?? \\$this->config->get('config_currency'))/g\" \"\$f\"; \
-              echo 'Patched:' \"\$f\"; \
-              grep -n \"config->get('config_currency')\" \"\$f\" || true; \
-            done \
-          "
+          docker compose exec -T "$PHP_SVC" bash -lc '
+            set -e
+            for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do
+              [ -f "$f" ] || continue
+              sed -i -E '"'"'s/\$this->session->data\[["'\''"]currency["'\''"]\]/(\$this->session->data['\''currency'\''] ?? \$this->config->get('\''config_currency'\''))/g'"'"' "$f"
+              echo "Patched: $f"
+              grep -n '"'"'config->get('\''config_currency'\'')'"'"' "$f" || true
+            done
+          '
 
       - name: Wait for OpenCart to be reachable
         shell: bash
