@@ -24,31 +24,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           WEB_SVC="apache"
           PHP_SVC="php"
           DB_SVC="mysql"
 
-          # Autodetect the PHP service if named differently
+          # Autodetect PHP service if named differently
           if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
             PHP_SVC=""
             for s in $(docker compose ps --services); do
               if docker compose exec -T "$s" sh -lc 'command -v php >/dev/null 2>&1'; then
-                PHP_SVC="$s"
-                break
+                PHP_SVC="$s"; break
               fi
             done
           fi
 
-          # Autodetect web and db if necessary
+          # Autodetect web/db if necessary
           if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose ps --services | head -n 1)"
           fi
           if ! docker compose ps --services | grep -qx "$DB_SVC"; then
             for s in $(docker compose ps --services); do
               if docker compose exec -T "$s" sh -lc 'test -d /var/lib/mysql || test -d /bitnami/mariadb'; then
-                DB_SVC="$s"
-                break
+                DB_SVC="$s"; break
               fi
             done
           fi
@@ -62,14 +59,11 @@ jobs:
           # Optional CLI installer path
           INSTALLER=""
           for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
-            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then
-              INSTALLER="$p"
-              break
-            fi
+            if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
           done
           echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
 
-          # Local URL (published port)
+          # Local base URL (published port)
           PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n 1 || true)"
           if [ -z "$PORT" ]; then
             PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n 1 || true)"
@@ -86,15 +80,11 @@ jobs:
           set -euo pipefail
           CID="$(docker compose ps -q "$DB_SVC")"
           [ -z "$CID" ] && { echo "::error::Cannot find DB container for $DB_SVC"; docker compose ps; exit 1; }
-          echo "Waiting for DB container ($DB_SVC) healthcheck…"
+          echo "Waiting for DB container ($DB_SVC)…"
           for i in {1..60}; do
             STATUS="$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo unknown)"
-            if [ "$STATUS" = "healthy" ]; then
-              echo "DB healthy"
-              break
-            fi
-            echo "DB health: $STATUS ($i/60)"
-            sleep 2
+            if [ "$STATUS" = "healthy" ]; then echo "DB healthy"; break; fi
+            echo "DB health: $STATUS ($i/60)"; sleep 2
             if [ "$i" -eq 60 ]; then
               echo "::warning::Healthcheck timeout; trying mysqladmin ping…"
               docker compose exec -T "$DB_SVC" sh -lc \
@@ -114,10 +104,7 @@ jobs:
             set -e
             ROOT=""
             for b in /var/www/html /var/www; do
-              if [ -f "$b/upload/config-dist.php" ] || [ -f "$b/upload/config.php" ]; then
-                ROOT="$b"
-                break
-              fi
+              if [ -f "$b/upload/config-dist.php" ] || [ -f "$b/upload/config.php" ]; then ROOT="$b"; break; fi
             done
             [ -z "$ROOT" ] && { echo "Cannot locate /var/www*/upload"; exit 1; }
             cp -n "$ROOT/upload/config-dist.php" "$ROOT/upload/config.php" || true
@@ -131,19 +118,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
-
-          DB_HOST="$DB_SVC"
-          DB_PORT="${DB_PORT:-3306}"
+          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
           DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
           DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
           DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
-
           docker compose exec -T "$PHP_SVC" sh -lc "php -d display_errors=1 -d error_reporting=32767 '$INSTALLER' install \
             --db_hostname '$DB_HOST' \
             --db_username '$DB_USER' \
@@ -155,7 +138,6 @@ jobs:
             --password admin123 \
             --email admin@example.com \
             --http_server '${LOCAL_BASE_URL%/}/'"
-
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
       - name: Finalize base URLs and DB settings in configs
@@ -164,16 +146,13 @@ jobs:
           set -euo pipefail
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
-
-          DB_HOST="$DB_SVC"
-          DB_PORT="${DB_PORT:-3306}"
+          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
           DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
           DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
           DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
-
           docker compose exec -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
                               -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
                               -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB_PASS="$DB_PASS" \
@@ -181,10 +160,7 @@ jobs:
             set -e
             ROOT=""
             for b in /var/www/html /var/www; do
-              if [ -d "$b/upload" ]; then
-                ROOT="$b"
-                break
-              fi
+              if [ -d "$b/upload" ]; then ROOT="$b"; break; fi
             done
             [ -z "$ROOT" ] && exit 0
             BASE="$ROOT/upload"
@@ -220,10 +196,10 @@ jobs:
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               [ -d "$root" ] || continue
               cat > "$root/.user.ini" <<'"'"'INI'"'"'
-          display_errors = 0
-          display_startup_errors = 0
-          error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
-          INI
+display_errors = 0
+display_startup_errors = 0
+error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
+INI
               echo "Wrote $root/.user.ini"
             done
           '
@@ -232,59 +208,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           PREFIX="${DB_PREFIX:-oc_}"
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
-
-          DB_HOST="$DB_SVC"
-          DB_PORT="${DB_PORT:-3306}"
+          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
           DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
           DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
           DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
-
           UPSERT_CCY="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
                       VALUES (0,'config','config_currency','USD')
                       ON DUPLICATE KEY UPDATE value='USD';"
-
           docker compose exec -T "$DB_SVC" sh -lc \
             "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
 
-      # Robust patch: handles ["currency"] and ['currency'] reads
+      # Robust patch (no heredoc; single sed -E handles both 'currency' and "currency")
       - name: Patch currency reads with default fallback
         shell: bash
         run: |
           set -euo pipefail
-          docker compose exec -T "$PHP_SVC" bash -lc '
-            set -e
-            cat > /tmp/currency_fallback_patch.php << "PHP"
-          <?php
-          $files = [
-            "/var/www/html/upload/catalog/controller/product/thumb.php",
-            "/var/www/upload/catalog/controller/product/thumb.php",
-          ];
-          foreach ($files as $f) {
-            if (!is_file($f)) continue;
-            $c = file_get_contents($f);
-            $c = preg_replace(
-              "/\\$this->session->data\\[[\"\\\']currency[\"\\\']\\]/",
-              "(\$this->session->data['currency'] ?? \$this->config->get('config_currency'))",
-              $c, -1, $n
-            );
-            file_put_contents($f, $c);
-            echo $f, \": $n replacements\n\";
-          }
-          PHP
-            php /tmp/currency_fallback_patch.php
-            for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do
-              [ -f "$f" ] || continue
-              echo "Remaining currency reads in $f:"
-              grep -n "session->data.*currency" "$f" || true
-            done
-          '
+          docker compose exec -T "$PHP_SVC" bash -lc " \
+            for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do \
+              [ -f \"\$f\" ] || continue; \
+              sed -i -E \"s/\\$this->session->data\\[['\\\"]currency['\\\"]\\]/(\\$this->session->data['currency'] ?? \\$this->config->get('config_currency'))/g\" \"\$f\"; \
+              echo 'Patched:' \"\$f\"; \
+              grep -n \"config->get('config_currency')\" \"\$f\" || true; \
+            done \
+          "
 
       - name: Wait for OpenCart to be reachable
         shell: bash
@@ -292,11 +244,9 @@ jobs:
           set -euo pipefail
           for i in {1..90}; do
             if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
-              echo "OpenCart is up at $LOCAL_BASE_URL"
-              exit 0
+              echo "OpenCart is up at $LOCAL_BASE_URL"; exit 0
             fi
-            echo "Waiting for OpenCart... ($i/90)"
-            sleep 3
+            echo "Waiting for OpenCart... ($i/90)"; sleep 3
           done
           echo "::group::Recent container logs"
           docker compose logs --no-color --tail=300
