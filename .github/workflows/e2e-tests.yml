@@ -28,7 +28,7 @@ jobs:
           PHP_SVC="php"
           DB_SVC="mysql"
 
-          # Autodetect PHP service
+          # Autodetect PHP service if named differently
           if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
             PHP_SVC=""
             for s in $(docker compose ps --services); do
@@ -38,7 +38,7 @@ jobs:
             done
           fi
 
-          # Autodetect web/db if needed
+          # Autodetect web/db if necessary
           if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose ps --services | head -n 1)"
           fi
@@ -64,9 +64,9 @@ jobs:
           echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
 
           # Local base URL (published port)
-          PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
+          PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n 1 || true)"
           if [ -z "$PORT" ]; then
-            PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
+            PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n 1 || true)"
           fi
           if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
             echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
@@ -127,7 +127,6 @@ jobs:
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
-
           docker compose exec -T "$PHP_SVC" sh -lc "php -d display_errors=1 -d error_reporting=32767 '$INSTALLER' install \
             --db_hostname '$DB_HOST' \
             --db_username '$DB_USER' \
@@ -139,10 +138,8 @@ jobs:
             --password admin123 \
             --email admin@example.com \
             --http_server '${LOCAL_BASE_URL%/}/'"
-
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
 
-      # --- SAFE: write a PHP patcher via a host-side heredoc piped into the container ---
       - name: Finalize base URLs and DB settings in configs
         shell: bash
         run: |
@@ -156,57 +153,41 @@ jobs:
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
+          docker compose exec -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
+                              -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
+                              -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB_PASS="$DB_PASS" \
+                              -T "$PHP_SVC" bash -lc '
+            set -e
+            ROOT=""
+            for b in /var/www/html /var/www; do
+              if [ -d "$b/upload" ]; then ROOT="$b"; break; fi
+            done
+            [ -z "$ROOT" ] && exit 0
+            BASE="$ROOT/upload"
+            CFG_APP="$BASE/config.php"
+            CFG_ADM="$BASE/admin/config.php"
+            update_cfg() {
+              local file="$1"
+              sed -i \
+                -e "s|define('\''HTTP_SERVER'\''.*|define('\''HTTP_SERVER'\'', '\''${LOCAL_BASE_URL%/}/'\'');|" \
+                -e "s|define('\''HTTP_CATALOG'\''.*|define('\''HTTP_CATALOG'\'', '\''${LOCAL_BASE_URL%/}/'\'');|" \
+                -e "s|define('\''DIR_APPLICATION'\''.*|define('\''DIR_APPLICATION'\'', '\''$BASE/catalog/'\'');|" \
+                -e "s|define('\''DIR_SYSTEM'\''.*|define('\''DIR_SYSTEM'\'', '\''$BASE/system/'\'');|" \
+                -e "s|define('\''DIR_IMAGE'\''.*|define('\''DIR_IMAGE'\'', '\''$BASE/image/'\'');|" \
+                -e "s|define('\''DB_DRIVER'\''.*|define('\''DB_DRIVER'\'', '\''mysqli'\'');|" \
+                -e "s|define('\''DB_HOSTNAME'\''.*|define('\''DB_HOSTNAME'\'', '\''$DB_HOST'\'');|" \
+                -e "s|define('\''DB_USERNAME'\''.*|define('\''DB_USERNAME'\'', '\''$DB_USER'\'');|" \
+                -e "s|define('\''DB_PASSWORD'\''.*|define('\''DB_PASSWORD'\'', '\''$DB_PASS'\'');|" \
+                -e "s|define('\''DB_DATABASE'\''.*|define('\''DB_DATABASE'\'', '\''$DB_NAME'\'');|" \
+                -e "s|define('\''DB_PORT'\''.*|define('\''DB_PORT'\'', '\''$DB_PORT'\'');|" \
+                -e "s|define('\''DB_PREFIX'\''.*|define('\''DB_PREFIX'\'', '\''oc_'\'' );|" \
+                "$file"
+            }
+            [ -f "$CFG_APP" ] && update_cfg "$CFG_APP" || true
+            [ -f "$CFG_ADM" ] && update_cfg "$CFG_ADM" || true
+          '
 
-          cat <<'PHP' | docker compose exec -T \
-            -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
-            -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
-            -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB_PASS="$DB_PASS" \
-            "$PHP_SVC" bash -lc 'cat > /tmp/oc_cfg_patch.php && php /tmp/oc_cfg_patch.php'
-          <?php
-          $base = null;
-          foreach (["/var/www/html/upload", "/var/www/upload"] as $b) {
-            if (is_dir($b)) { $base = $b; break; }
-          }
-          if (!$base) { exit(0); }
-
-          $cfgApp = "$base/config.php";
-          $cfgAdm = "$base/admin/config.php";
-
-          $http = rtrim(getenv("LOCAL_BASE_URL") ?: "http://localhost", "/") . "/";
-          $db = [
-            "host" => getenv("DB_HOST") ?: "localhost",
-            "port" => getenv("DB_PORT") ?: "3306",
-            "name" => getenv("DB_NAME") ?: "opencart",
-            "user" => getenv("DB_USER") ?: "root",
-            "pass" => getenv("DB_PASS") ?: "",
-          ];
-          
-          function rewriteCfg($file, $base, $http, $db) {
-            if (!is_file($file)) return;
-            $c = file_get_contents($file);
-            $map = [
-              "/define\\('HTTP_SERVER'.*/"     => "define('HTTP_SERVER', '$http');",
-              "/define\\('HTTP_CATALOG'.*/"    => "define('HTTP_CATALOG', '$http');",
-              "/define\\('DIR_APPLICATION'.*/" => "define('DIR_APPLICATION', '{$base}/catalog/');",
-              "/define\\('DIR_SYSTEM'.*/"      => "define('DIR_SYSTEM', '{$base}/system/');",
-              "/define\\('DIR_IMAGE'.*/"       => "define('DIR_IMAGE', '{$base}/image/');",
-               "/define\\('DB_DRIVER'.*/"       => "define('DB_DRIVER', 'mysqli');",
-              "/define\\('DB_HOSTNAME'.*/"     => "define('DB_HOSTNAME', '{$db['host']}');",
-              "/define\\('DB_USERNAME'.*/"     => "define('DB_USERNAME', '{$db['user']}');",
-              "/define\\('DB_PASSWORD'.*/"     => "define('DB_PASSWORD', '{$db['pass']}');",
-              "/define\\('DB_DATABASE'.*/"     => "define('DB_DATABASE', '{$db['name']}');",
-              "/define\\('DB_PORT'.*/"         => "define('DB_PORT', '{$db['port']}');",
-              "/define\\('DB_PREFIX'.*/"       => "define('DB_PREFIX', 'oc_');",
-            ];
-            foreach ($map as $re => $rep) { $c = preg_replace($re, $rep, $c); }
-            file_put_contents($file, $c);
-            echo "Patched: $file\n";
-          }
-
-          rewriteCfg($cfgApp, $base, $http, $db);
-          rewriteCfg($cfgAdm, $base, $http, $db);
-          PHP
-
+      # Global suppression so notices never render as a blank page
       - name: Silence PHP notices globally (.user.ini)
         shell: bash
         run: |
@@ -220,18 +201,6 @@ jobs:
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
           INI
               echo "Wrote $root/.user.ini"
-            done
-          '
-
-      - name: Force disable display_errors in entrypoints
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose exec -T "$PHP_SVC" bash -lc '
-            for idx in /var/www/html/upload/index.php /var/www/upload/index.php /var/www/html/upload/admin/index.php /var/www/upload/admin/index.php; do
-              [ -f "$idx" ] || continue
-              sed -i "1s|<?php|<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); |" "$idx"
-              head -n 1 "$idx"
             done
           '
 
@@ -249,37 +218,26 @@ jobs:
           ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
           if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
           : "${DB_NAME:=opencart}"
-
           UPSERT_CCY="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
                       VALUES (0,'config','config_currency','USD')
                       ON DUPLICATE KEY UPDATE value='USD';"
           docker compose exec -T "$DB_SVC" sh -lc \
             "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
 
+      # Robust patch (single-quoted remote script prevents $this expansion)
       - name: Patch currency reads with default fallback
         shell: bash
         run: |
           set -euo pipefail
-          cat <<'PHP' | docker compose exec -T "$PHP_SVC" bash -lc 'cat > /tmp/oc_currency_patch.php && php /tmp/oc_currency_patch.php'
-          <?php
-          $targets = [
-            "/var/www/html/upload/catalog/controller/product/thumb.php",
-            "/var/www/upload/catalog/controller/product/thumb.php",
-          ];
-          foreach ($targets as $f) {
-            if (!is_file($f)) continue;
-            $c = file_get_contents($f);
-            $c = preg_replace(
-              "/\\$this->session->data\\s*\\[\\s*[\"\\']currency[\"\\']\\s*\\]/",
-              "(\$this->session->data['currency'] ?? \$this->config->get('config_currency'))",
-              $c,
-              -1,
-              $n
-            );
-            file_put_contents($f, $c);
-            echo $f, ": ", $n, " replacement(s)\n";
-          }
-          PHP
+          docker compose exec -T "$PHP_SVC" bash -lc '
+            set -e
+            for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do
+              [ -f "$f" ] || continue
+              sed -i -E '"'"'s/\$this->session->data\[["'\''"]currency["'\''"]\]/(\$this->session->data['\''currency'\''] ?? \$this->config->get('\''config_currency'\''))/g'"'"' "$f"
+              echo "Patched: $f"
+              grep -n '"'"'config->get('\''config_currency'\'')'"'"' "$f" || true
+            done
+          '
 
       - name: Wait for OpenCart to be reachable
         shell: bash
