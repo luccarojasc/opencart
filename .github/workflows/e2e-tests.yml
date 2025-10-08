@@ -251,11 +251,32 @@ jobs:
             "$DB_CLI -h $DB_HOST_LOCAL -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"SHOW TABLES LIKE '${PREFIX}setting'\" | grep -q ${PREFIX}setting" \
             || { echo '::error::OpenCart tables missing. Ensure the installer step ran.'; exit 1; }
 
-          UPSERT_CCY="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
-                      VALUES (0,'config','config_currency','USD')
-                      ON DUPLICATE KEY UPDATE value='USD';"
-          docker compose exec -T "$DB_SVC" sh -lc \
-            "$DB_CLI -h $DB_HOST_LOCAL -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\""
+          # Use a quoted heredoc so backticks in `key` are not eaten by the shell
+          docker compose exec -T "$DB_SVC" sh -lc '
+            set -e
+            DB_CLI=$(command -v mysql || command -v mariadb)
+            DB_HOST="'"$DB_HOST_LOCAL"'"
+            DB_PORT="'"$DB_PORT"'"
+            DB_NAME="'"$DB_NAME"'"
+            DB_USER="'"$DB_USER"'"
+            DB_PASS="'"$DB_PASS"'"
+            PFX="'"$PREFIX"'"
+
+            cat > /tmp/upsert.sql <<'"'"'SQL'"'"'
+          UPDATE __PFX__setting
+             SET value='\''USD'\''
+           WHERE code='\''config'\'' AND `key`='\''config_currency'\'';
+      
+          INSERT INTO __PFX__setting (store_id, code, `key`, value)
+          SELECT 0, '\''config'\'', '\''config_currency'\'', '\''USD'\''
+          WHERE NOT EXISTS (
+            SELECT 1 FROM __PFX__setting
+             WHERE code='\''config'\'' AND `key`='\''config_currency'\''
+          );
+          SQL
+            sed -i "s/__PFX__/${PFX}/g" /tmp/upsert.sql
+            $DB_CLI -h "$DB_HOST" -P "$DB_PORT" -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" < /tmp/upsert.sql
+          '
 
       - name: Patch currency reads with default fallback
         shell: bash
