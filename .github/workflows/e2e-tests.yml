@@ -261,23 +261,23 @@ jobs:
           docker compose exec -T "$PHP_SVC" bash -lc '
             set -e
             cat > /tmp/currency_fallback_patch.php << "PHP"
-<?php
-$files = [
-  "/var/www/html/upload/catalog/controller/product/thumb.php",
-  "/var/www/upload/catalog/controller/product/thumb.php",
-];
-foreach ($files as $f) {
-  if (!is_file($f)) continue;
-  $c = file_get_contents($f);
-  $c = preg_replace(
-    "/\\$this->session->data\\[[\"\\\']currency[\"\\\']\\]/",
-    "(\$this->session->data['currency'] ?? \$this->config->get('config_currency'))",
-    $c, -1, $n
-  );
-  file_put_contents($f, $c);
-  echo $f, \": $n replacements\n\";
-}
-PHP
+          <?php
+          $files = [
+            "/var/www/html/upload/catalog/controller/product/thumb.php",
+            "/var/www/upload/catalog/controller/product/thumb.php",
+          ];
+          foreach ($files as $f) {
+            if (!is_file($f)) continue;
+            $c = file_get_contents($f);
+            $c = preg_replace(
+              "/\\$this->session->data\\[[\"\\\']currency[\"\\\']\\]/",
+              "(\$this->session->data['currency'] ?? \$this->config->get('config_currency'))",
+              $c, -1, $n
+            );
+            file_put_contents($f, $c);
+            echo $f, \": $n replacements\n\";
+          }
+          PHP
             php /tmp/currency_fallback_patch.php
             for f in /var/www/html/upload/catalog/controller/product/thumb.php /var/www/upload/catalog/controller/product/thumb.php; do
               [ -f "$f" ] || continue
