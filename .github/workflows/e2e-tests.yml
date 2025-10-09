@@ -383,7 +383,6 @@ jobs:
             --token "$TESTRIGOR_CI_TOKEN" \
             --localhost --url "$HOME_URL" \
             --verbose
-
       - name: Dump logs on failure
         if: failure()
         run: docker compose logs --no-color --tail=200
