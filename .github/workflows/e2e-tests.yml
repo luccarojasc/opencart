@@ -249,7 +249,7 @@ jobs:
           UPDATE __PFX__setting
              SET value='\''USD'\''
            WHERE code='\''config'\'' AND `key`='\''config_currency'\'';
-
+          
           INSERT INTO __PFX__setting (store_id, code, `key`, value)
           SELECT 0, '\''config'\'', '\''config_currency'\'', '\''USD'\''
           WHERE NOT EXISTS (
@@ -271,32 +271,11 @@ jobs:
               f="$base/catalog/controller/product/thumb.php"
               [ -f "$f" ] || continue
 
-              # Replace raw reads with a safe fallback (idempotent)
+              # Replace direct session reads with a safe fallback (idempotent)
               sed -i -E "s/\$this->session->data\[([\"'"'"'])currency\1\]/(\$this->session->data['"'"'currency'"'"'] ?? \$this->config->get('"'"'config_currency'"'"') ?: '"'"'USD'"'"')/g" "$f"
 
-              # If the file still doesn't contain config_currency anywhere, insert a guard at the start of index()
-              if ! grep -q "config_currency" "$f"; then
-                awk '"'"'
-                  BEGIN{inserted=0}
-                  /public[[:space:]]+function[[:space:]]+index[[:space:]]*\(/{
-                    print $0
-                    getline
-                    if ($0 ~ /{/) {
-                      print "{"
-                      print "        if (!isset($this->session->data[\"currency\"])) {"
-                      print "            $this->session->data[\"currency\"] = $this->config->get(\"config_currency\") ?: \"USD\";"
-                      print "        }"
-                      inserted=1
-                      next
-                    }
-                  }
-                  { print }
-                  END{ if(!inserted){ /* no-op if pattern not found */ } }
-                '"'"' "$f" > "$f.new" && mv "$f.new" "$f"
-              fi
-
               echo "Patched: $f"
-              nl -ba "$f" | sed -n "1,140p"
+              grep -n "currency" "$f" | sed -n "1,5p" || true
             done
           '
 
