@@ -187,7 +187,7 @@ jobs:
             [ -f "$CFG_ADM" ] && update_cfg "$CFG_ADM" || true
           '
 
-      # Final, last-wins PHP ini to prevent warnings from rendering as the page
+      # Last-wins global ini so warnings don't render as pages
       - name: Silence PHP notices/warnings (last-wins ini)
         shell: bash
         run: |
@@ -202,6 +202,23 @@ jobs:
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
           EOF
             php -i | egrep "Loaded Configuration File|additional .ini|error_reporting|display_errors" || true
+          '
+
+      # Also create .user.ini so FPM picks settings up without reload
+      - name: Silence PHP notices per-directory (.user.ini)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose exec -T "$PHP_SVC" bash -lc '
+            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
+              [ -d "$root" ] || continue
+              cat > "$root/.user.ini" <<'"'"'INI'"'"'
+          display_errors = 0
+          display_startup_errors = 0
+          error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
+          INI
+              echo "Wrote $root/.user.ini"
+            done
           '
 
       - name: Ensure default currency set (USD) in DB
@@ -229,12 +246,12 @@ jobs:
           fi
           echo "Using DB client: $DB_CLI"
 
-          # Ensure tables exist (fail early with a clear message)
+          # Ensure tables exist
           docker compose exec -T "$DB_SVC" sh -lc \
             "$DB_CLI -h $DB_HOST_LOCAL -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"SHOW TABLES LIKE '${PREFIX}setting'\" | grep -q ${PREFIX}setting" \
             || { echo '::error::OpenCart tables missing. Ensure the installer step ran.'; exit 1; }
 
-          # Use quoted heredoc so backticks in `key` aren't eaten by the shell
+          # Upsert default currency using a quoted heredoc (preserves backticks)
           docker compose exec -T "$DB_SVC" sh -lc '
             set -e
             DB_CLI=$(command -v mysql || command -v mariadb)
@@ -249,8 +266,8 @@ jobs:
           UPDATE __PFX__setting
              SET value='\''USD'\''
            WHERE code='\''config'\'' AND `key`='\''config_currency'\'';
-          
-          INSERT INTO __PFX__setting (store_id, code, `key`, value)
+
+          INSERT INTO  __PFX__setting (store_id, code, `key`, value)
           SELECT 0, '\''config'\'', '\''config_currency'\'', '\''USD'\''
           WHERE NOT EXISTS (
             SELECT 1 FROM __PFX__setting
@@ -261,22 +278,39 @@ jobs:
             $DB_CLI -h "$DB_HOST" -P "$DB_PORT" -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" < /tmp/upsert.sql
           '
 
-      - name: Patch product/thumb.php to be currency-safe
+      # Universal fix: ensure session currency exists before OpenCart runs
+      - name: Force-set session currency on every request (auto_prepend_file)
         shell: bash
         run: |
           set -euo pipefail
           docker compose exec -T "$PHP_SVC" bash -lc '
             set -e
-            for base in /var/www/html/upload /var/www/upload; do
-              f="$base/catalog/controller/product/thumb.php"
-              [ -f "$f" ] || continue
+            PREPEND="/usr/local/etc/php/testrigor-prepend.php"
+            cat > "$PREPEND" <<'"'"'PHP'"'"'
+          <?php
+          if (PHP_SAPI !== "cli") {
+            if (function_exists("session_status") && session_status() === PHP_SESSION_NONE) { @session_start(); }
+            if (empty($_SESSION["currency"])) {
+              $_SESSION["currency"] = getenv("OC_DEFAULT_CURRENCY") ?: "USD";
+            }
+          }
+          PHP
+            chmod 644 "$PREPEND"
 
-              # Replace direct session reads with a safe fallback (idempotent)
-              sed -i -E "s/\$this->session->data\[([\"'"'"'])currency\1\]/(\$this->session->data['"'"'currency'"'"'] ?? \$this->config->get('"'"'config_currency'"'"') ?: '"'"'USD'"'"')/g" "$f"
+            # Put directive into .ini (for CLI) and .user.ini (for FPM without reload)
+            INI_DIR="$(php -i | sed -n "s/^Scan this dir for additional \.ini files => //p")"
+            [ -d "$INI_DIR" ] || INI_DIR="/usr/local/etc/php/conf.d"
+            echo "" >> "$INI_DIR/999-testrigor.ini"
+            echo "; Ensure prepend runs before app to set session currency" >> "$INI_DIR/999-testrigor.ini"
+            echo "auto_prepend_file = $PREPEND" >> "$INI_DIR/999-testrigor.ini"
 
-              echo "Patched: $f"
-              grep -n "currency" "$f" | sed -n "1,5p" || true
+            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
+              [ -d "$root" ] || continue
+              echo "auto_prepend_file = $PREPEND" >> "$root/.user.ini"
             done
+
+            echo "Verifying:"
+            php -i | egrep "additional .ini|999-testrigor.ini|auto_prepend_file" || true
           '
 
       - name: Wait for OpenCart to be reachable
