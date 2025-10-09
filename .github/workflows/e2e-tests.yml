@@ -19,7 +19,6 @@ jobs:
         run: |
           docker compose -f docker-compose.yml up -d --build --remove-orphans --quiet-pull
           docker compose ps
-
       - name: Detect services and URL
         shell: bash
         run: |
@@ -27,7 +26,6 @@ jobs:
           WEB_SVC="apache"
           PHP_SVC="php"
           DB_SVC="mysql"
-
           # Autodetect PHP service if named differently
           if ! docker compose ps --services | grep -qx "$PHP_SVC"; then
             PHP_SVC=""
@@ -37,7 +35,6 @@ jobs:
               fi
             done
           fi
-
           # Autodetect web/db if necessary
           if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose ps --services | head -n 1)"
@@ -49,20 +46,16 @@ jobs:
               fi
             done
           fi
-
           [ -z "$PHP_SVC" ] && { echo "::error::No container with PHP CLI found"; docker compose ps; exit 1; }
-
           echo "WEB_SVC=$WEB_SVC" >> "$GITHUB_ENV"
           echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
           echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
-
-          # Optional CLI installer path (if present in your image)
+          # Optional CLI installer path
           INSTALLER=""
           for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
             if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
           done
           echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
-
           # Local base URL (published port)
           PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n 1 || true)"
           if [ -z "$PORT" ]; then
@@ -73,8 +66,7 @@ jobs:
           else
             echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
-
-      - name: Wait for DB socket/health
+      - name: Wait for DB to be ready
         shell: bash
         run: |
           set -euo pipefail
@@ -86,7 +78,7 @@ jobs:
             if [ "$STATUS" = "healthy" ]; then echo "DB healthy"; break; fi
             echo "DB health: $STATUS ($i/60)"; sleep 2
             if [ "$i" -eq 60 ]; then
-              echo "::warning::No healthcheck; trying mysqladmin ping…"
+              echo "::warning::Healthcheck timeout; trying mysqladmin ping…"
               docker compose exec -T "$DB_SVC" sh -lc \
                 "mysqladmin ping -h 127.0.0.1 --silent || \
                  mysqladmin ping -h 127.0.0.1 -uroot --silent || \
@@ -95,29 +87,6 @@ jobs:
               break
             fi
           done
-
-      - name: Block until app credentials work (prevents early auto-install)
-        shell: bash
-        run: |
-          set -euo pipefail
-          DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
-          getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
-          DB_PORT="${DB_PORT:-3306}"
-          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
-          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
-          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
-          DB_HOST_LOCAL="127.0.0.1"
-          DB_CLI="$(docker compose exec -T "$DB_SVC" sh -lc 'if command -v mysql >/dev/null 2>&1; then echo mysql; elif command -v mariadb >/dev/null 2>&1; then echo mariadb; else echo ""; fi')"
-          [ -z "$DB_CLI" ] && { echo "::warning::No mysql client in DB container; skipping auth wait"; exit 0; }
-          echo "Waiting for DB to accept app credentials ($DB_USER@$DB_HOST_LOCAL)…"
-          for i in {1..120}; do
-            if docker compose exec -T "$DB_SVC" sh -lc "$DB_CLI -h $DB_HOST_LOCAL -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' -e 'SELECT 1' >/dev/null 2>&1"; then
-              echo "DB ready for app user"; exit 0
-            fi
-            sleep 2
-          done
-          echo "::error::DB never accepted app credentials"; exit 1
-
       - name: Prepare config files and permissions
         shell: bash
         run: |
@@ -134,7 +103,6 @@ jobs:
             chmod 666 "$ROOT/upload/config.php" "$ROOT/upload/admin/config.php" || true
             chown -R www-data:www-data "$ROOT/upload" || true
           '
-
       - name: Install OpenCart via CLI (if present)
         if: env.INSTALLER != ''
         shell: bash
@@ -161,7 +129,6 @@ jobs:
             --email admin@example.com \
             --http_server '${LOCAL_BASE_URL%/}/'"
           docker compose exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/upload/install /var/www/upload/install 2>/dev/null || true'
-
       - name: Finalize base URLs and DB settings in configs
         shell: bash
         run: |
@@ -208,7 +175,7 @@ jobs:
             [ -f "$CFG_APP" ] && update_cfg "$CFG_APP" || true
             [ -f "$CFG_ADM" ] && update_cfg "$CFG_ADM" || true
           '
-
+      # Last-wins global ini so warnings don't render as pages
       - name: Silence PHP notices/warnings (last-wins ini)
         shell: bash
         run: |
@@ -224,8 +191,8 @@ jobs:
           EOF
             php -i | egrep "Loaded Configuration File|additional .ini|error_reporting|display_errors" || true
           '
-
-      - name: Also write .user.ini (no FPM reload needed)
+      # Also create .user.ini so FPM picks settings up without reload
+      - name: Silence PHP notices per-directory (.user.ini)
         shell: bash
         run: |
           set -euo pipefail
@@ -237,29 +204,36 @@ jobs:
           display_startup_errors = 0
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
           INI
+              echo "Wrote $root/.user.ini"
             done
           '
-
       - name: Ensure default currency set (USD) in DB
         shell: bash
         run: |
           set -euo pipefail
           PREFIX="${DB_PREFIX:-oc_}"
+          # Gather DB connection values from the DB container env
           DB_ENV="$(docker compose exec -T "$DB_SVC" sh -lc 'env' || true)"
           getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
           DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
           DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
           DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
+          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
+          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
+          : "${DB_NAME:=opencart}"
           DB_PORT="${DB_PORT:-3306}"
           DB_HOST_LOCAL="127.0.0.1"
+          # Detect a SQL client inside the DB container (mysql or mariadb)
           DB_CLI="$(docker compose exec -T "$DB_SVC" sh -lc 'if command -v mysql >/dev/null 2>&1; then echo mysql; elif command -v mariadb >/dev/null 2>&1; then echo mariadb; else echo ""; fi')"
-          [ -z "$DB_CLI" ] && { echo "::warning::No mysql client in DB container; skipping currency upsert"; exit 0; }
-
-          # If oc_setting doesn't exist yet, bail with a clear message
+          if [ -z "$DB_CLI" ]; then
+            echo "::error::No mysql/mariadb client found in DB container '$DB_SVC'."; exit 1
+          fi
+          echo "Using DB client: $DB_CLI"
+          # Ensure tables exist
           docker compose exec -T "$DB_SVC" sh -lc \
             "$DB_CLI -h $DB_HOST_LOCAL -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"SHOW TABLES LIKE '${PREFIX}setting'\" | grep -q ${PREFIX}setting" \
-            || { echo '::warning::OpenCart tables missing; installation likely failed early.'; exit 0; }
-
+            || { echo '::error::OpenCart tables missing. Ensure the installer step ran.'; exit 1; }
+          # Upsert default currency using a quoted heredoc (preserves backticks)
           docker compose exec -T "$DB_SVC" sh -lc '
             set -e
             DB_CLI=$(command -v mysql || command -v mariadb)
@@ -269,13 +243,11 @@ jobs:
             DB_USER="'"$DB_USER"'"
             DB_PASS="'"$DB_PASS"'"
             PFX="'"$PREFIX"'"
-
             cat > /tmp/upsert.sql <<'"'"'SQL'"'"'
           UPDATE __PFX__setting
              SET value='\''USD'\''
            WHERE code='\''config'\'' AND `key`='\''config_currency'\'';
-
-          INSERT INTO __PFX__setting (store_id, code, `key`, value)
+          INSERT INTO  __PFX__setting (store_id, code, `key`, value)
           SELECT 0, '\''config'\'', '\''config_currency'\'', '\''USD'\''
           WHERE NOT EXISTS (
             SELECT 1 FROM __PFX__setting
@@ -285,7 +257,7 @@ jobs:
             sed -i "s/__PFX__/${PFX}/g" /tmp/upsert.sql
             $DB_CLI -h "$DB_HOST" -P "$DB_PORT" -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" < /tmp/upsert.sql
           '
-
+      # Universal fix: ensure session currency exists before OpenCart runs
       - name: Force-set session currency on every request (auto_prepend_file)
         shell: bash
         run: |
@@ -303,43 +275,19 @@ jobs:
           }
           PHP
             chmod 644 "$PREPEND"
-
+            # Put directive into .ini (for CLI) and .user.ini (for FPM without reload)
             INI_DIR="$(php -i | sed -n "s/^Scan this dir for additional \.ini files => //p")"
             [ -d "$INI_DIR" ] || INI_DIR="/usr/local/etc/php/conf.d"
-            {
-              echo ""; echo "; Ensure prepend runs before app to set session currency";
-              echo "auto_prepend_file = $PREPEND";
-            } >> "$INI_DIR/999-testrigor.ini"
-
+            echo "" >> "$INI_DIR/999-testrigor.ini"
+            echo "; Ensure prepend runs before app to set session currency" >> "$INI_DIR/999-testrigor.ini"
+            echo "auto_prepend_file = $PREPEND" >> "$INI_DIR/999-testrigor.ini"
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               [ -d "$root" ] || continue
               echo "auto_prepend_file = $PREPEND" >> "$root/.user.ini"
             done
-
+            echo "Verifying:"
             php -i | egrep "additional .ini|999-testrigor.ini|auto_prepend_file" || true
           '
-
-      - name: Patch controller to be currency-safe (defensive)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose exec -T "$PHP_SVC" sh -lc '
-            php -d detect_unicode=0 -r "
-              \$paths = [
-                \"/var/www/html/upload/catalog/controller/product/thumb.php\",
-                \"/var/www/upload/catalog/controller/product/thumb.php\"
-              ];
-              foreach (\$paths as \$f) {
-                if (!is_file(\$f)) continue;
-                \$src = file_get_contents(\$f);
-                \$re  = '/\\$this->session->data\\[[\\\"\\\']currency[\\\"\\\']\\]/';
-                \$rep = \"(\\$this->session->data['currency'] ?? \\$this->config->get('config_currency') ?: 'USD')\";
-                \$new = preg_replace(\$re, \$rep, \$src);
-                if (\$new !== null && \$new !== \$src) { file_put_contents(\$f, \$new); echo \"Patched: \$f\\n\"; }
-              }
-            "
-          '
-
       - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
@@ -355,12 +303,10 @@ jobs:
           docker compose logs --no-color --tail=300
           echo "::endgroup::"
           exit 1
-
       - name: Verify HTTP headers (sanity)
         run: |
           HOME_URL="${LOCAL_BASE_URL%/}/index.php?route=common/home"
           curl -LI "$HOME_URL" || true
-
       - name: Setup Node.js for testRigor CLI
         uses: actions/setup-node@v4
         with:
@@ -371,7 +317,6 @@ jobs:
           npm i -g testrigor-cli
           testrigor --version || true
           npx -y testrigor-cli --version || true
-
       - name: Trigger testRigor suite against localhost
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
