@@ -255,7 +255,6 @@ jobs:
           DB_CLI="$(docker compose exec -T "$DB_SVC" sh -lc 'if command -v mysql >/dev/null 2>&1; then echo mysql; elif command -v mariadb >/dev/null 2>&1; then echo mariadb; else echo ""; fi')"
           [ -z "$DB_CLI" ] && { echo "::warning::No mysql client in DB container; skipping currency upsert"; exit 0; }
 
-          # If oc_setting doesn't exist yet, bail with a clear message
           docker compose exec -T "$DB_SVC" sh -lc \
             "$DB_CLI -h $DB_HOST_LOCAL -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"SHOW TABLES LIKE '${PREFIX}setting'\" | grep -q ${PREFIX}setting" \
             || { echo '::warning::OpenCart tables missing; installation likely failed early.'; exit 0; }
@@ -319,20 +318,21 @@ jobs:
             php -i | egrep "additional .ini|999-testrigor.ini|auto_prepend_file" || true
           '
 
+      # --------- CHANGED STEP: write PHP locally, docker cp into container, then run ---------
       - name: Patch controller to be currency-safe (defensive)
         shell: bash
         run: |
           set -euo pipefail
-          docker compose exec -T "$PHP_SVC" bash -lc '
-            set -e
-            cat >/tmp/patch_currency.php <<'"'"'PHP'"'"'
+          # Write the PHP patch file on the runner (no nested quoting issues)
+          cat >/tmp/patch_currency.php <<'PHP'
           <?php
-          $paths = [
+          $paths = [  
             "/var/www/html/upload/catalog/controller/product/thumb.php",
             "/var/www/upload/catalog/controller/product/thumb.php"
           ];
           foreach ($paths as $f) {
             if (!is_file($f)) continue;
+            @chmod($f, 0664); // ensure writable, ignore errors
             $src = file_get_contents($f);
             $re  = '/\$this->session->data\[[\'"]currency[\'"]\]/';
             $rep = "(\$this->session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')";
@@ -340,11 +340,14 @@ jobs:
             if ($new !== null && $new !== $src) {
               file_put_contents($f, $new);
               echo "Patched: $f\n";
+            } else {
+              echo "No change (already safe): $f\n";
             }
           }
           PHP
-            php /tmp/patch_currency.php
-          '
+          CID="$(docker compose ps -q "$PHP_SVC")"
+          docker cp /tmp/patch_currency.php "$CID":/tmp/patch_currency.php
+          docker compose exec -T "$PHP_SVC" php /tmp/patch_currency.php
 
       - name: Wait for OpenCart to be reachable
         shell: bash
