@@ -221,7 +221,7 @@ jobs:
           display_startup_errors = Off
           log_errors = On
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
-          EOF  
+          EOF
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               [ -d "$root" ] || continue
               cat > "$root/.user.ini" <<'INI'
@@ -232,7 +232,6 @@ jobs:
             done
           '
 
-      # UPDATED: stronger global handler + prepend file
       - name: Force-set default currency very early (auto_prepend_file)
         shell: bash
         run: |
@@ -328,7 +327,7 @@ jobs:
             $DB_CLI -h 127.0.0.1 -P '"$DB_PORT"' -u"'"$DB_USER"'" -p"'"$DB_PASS"'" "'"$DB_NAME"'" < /tmp/upsert.sql
           '
 
-      # UPDATED: broader hardening (includes $_SESSION and a direct guard in product/thumb.php)
+      # SAFER hardening (no $this in $session/$_SESSION replacement)
       - name: Harden all currency reads project-wide
         shell: bash
         run: |
@@ -348,16 +347,21 @@ jobs:
           function write_file($f, $s) { @chmod($f, 0664); return file_put_contents($f, $s) !== false; }
 
           $re = [
+            // In controllers/services where $this exists:
             '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$this->s\s*e\s*s\s*s\s*i\s*o\s*n\s*->\s*data\s*\[\s*[\'"]currency[\'"]\s*\])/ix'
-              => "(\$this->session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')",
+              => "(\$this->session->data['currency'] ?? (\$this->config->get('config_currency') ?: 'USD'))",
+          
+            // In places that only have $session (no $this):
             '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$session\s*->\s*data\s*\[\s*[\'"]currency[\'"]\s*\])/i'
-              => "(\$session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')",
+              => "(\$session->data['currency'] ?? 'USD')",
+
+            // Raw superglobal:
             '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$_SESSION\s*\[\s*[\'"]currency[\'"]\s*\])/i'
               => "(\$_SESSION['currency'] ?? 'USD')",
           ];
 
           foreach ($roots as $r) {
-            // Direct guard in product/thumb.php
+            // Direct guard in product/thumb.php (idempotent)
             $thumb = "$r/catalog/controller/product/thumb.php";
             if (is_file($thumb)) {
               $src = file_get_contents($thumb);
@@ -365,7 +369,7 @@ jobs:
                 $src = preg_replace(
                   '/(<\?php)/',
                   "$0\n// __TR_CURRENCY_GUARD__\nif (!isset(\$this->session->data['currency']) || !is_string(\$this->session->data['currency']) || \$this->session->data['currency'] === '') {\n    \$this->session->data['currency'] = \$this->config->get('config_currency') ?: 'USD';\n}\n",
-                $src, 1, $cnt
+                  $src, 1, $cnt
                 );
                 if ($cnt && write_file($thumb, $src)) echo "Inserted guard: $thumb\n";
               }
@@ -395,16 +399,28 @@ jobs:
         run: |
           set -euo pipefail
           HOME_URL="${LOCAL_BASE_URL%/}/index.php?route=common/home"
+          echo "Waiting for $HOME_URL"
+          ok=0
           for i in {1..90}; do
-            if curl -fsS -o /dev/null -L "$HOME_URL"; then
-              echo "OpenCart is up at $HOME_URL"; exit 0
+            code="$(curl -s -o /dev/null -w "%{http_code}" -L "$HOME_URL" || true)"
+            if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+              echo "OpenCart is up (HTTP $code)"; ok=1; break
             fi
-            echo "Waiting for OpenCart... ($i/90)"; sleep 3
+            echo "HTTP $code … waiting ($i/90)"
+            if [ "$code" = "500" ] && { [ "$i" -eq 1 ] || [ $((i%10)) -eq 0 ]; }; then
+              echo "::group::Sampling Apache/PHP logs (iteration $i)"
+              docker compose exec -T "$WEB_SVC" sh -lc 'for f in /var/log/apache2/error.log /usr/local/apache2/logs/error_log /var/log/httpd/error_log; do [ -f "$f" ] && { echo "--- $f ---"; tail -n 120 "$f"; }; done || true'
+              docker compose exec -T "$PHP_SVC" sh -lc 'for f in /var/log/php*.log /var/log/php*/error.log /usr/local/var/log/php-fpm.log /var/log/fpm-php.www.log; do [ -f "$f" ] && { echo "--- $f ---"; tail -n 120 "$f"; }; done || true'
+              echo "::endgroup::"
+            fi
+            sleep 3
           done
-          echo "::group::Recent container logs"
-          docker compose logs --no-color --tail=300
-          echo "::endgroup::"
-          exit 1
+          if [ $ok -ne 1 ]; then
+            echo "::group::Recent container logs"
+            docker compose logs --no-color --tail=300
+            echo "::endgroup::"
+            exit 1
+          fi
 
       - name: Verify HTTP headers (sanity)
         run: |
