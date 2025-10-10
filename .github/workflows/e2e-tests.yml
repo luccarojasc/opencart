@@ -272,9 +272,9 @@ jobs:
 
             cat > /tmp/upsert.sql <<'"'"'SQL'"'"'
           UPDATE __PFX__setting
-              SET value='\''USD'\''
+             SET value='\''USD'\''
            WHERE code='\''config'\'' AND `key`='\''config_currency'\'';
-  
+          
           INSERT INTO __PFX__setting (store_id, code, `key`, value)
           SELECT 0, '\''config'\'', '\''config_currency'\'', '\''USD'\''
           WHERE NOT EXISTS (
@@ -324,7 +324,7 @@ jobs:
         run: |
           set -euo pipefail
           docker compose exec -T "$PHP_SVC" sh -lc '
-            php -d detect_unicode=0 -r "
+            php -r "
               \$paths = [
                 \"/var/www/html/upload/catalog/controller/product/thumb.php\",
                 \"/var/www/upload/catalog/controller/product/thumb.php\"
