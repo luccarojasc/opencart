@@ -56,7 +56,7 @@ jobs:
           echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
           echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
 
-          # Optional CLI installer path (if present)
+          # Optional CLI installer path
           INSTALLER=""
           for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
             if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
@@ -209,7 +209,7 @@ jobs:
             [ -f "$CFG_ADM" ] && update_cfg "$CFG_ADM" || true
           '
 
-      - name: Silence PHP notices/warnings (last-wins ini)
+      - name: Silence PHP notices/warnings (ini + user.ini)
         shell: bash
         run: |
           set -euo pipefail
@@ -222,21 +222,53 @@ jobs:
           log_errors = On
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
           EOF
-            php -i | egrep "Loaded Configuration File|additional .ini|error_reporting|display_errors" || true
-          '
-
-      - name: Also write .user.ini (no FPM reload needed)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose exec -T "$PHP_SVC" bash -lc '
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               [ -d "$root" ] || continue
-              cat > "$root/.user.ini" <<'"'"'INI'"'"'
+              cat > "$root/.user.ini" <<'INI'
           display_errors = 0
           display_startup_errors = 0
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
           INI
+            done
+          '
+
+      - name: Force-set default currency very early (auto_prepend_file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose exec -T "$PHP_SVC" bash -lc '
+            set -e
+            PREPEND="/usr/local/etc/php/testrigor-prepend.php"
+            cat > "$PREPEND" <<'"'"'PHP'"'"'
+          <?php
+          // Make sure errors never print to browser even if .ini is ignored
+          @ini_set("display_errors", "0");
+          @ini_set("display_startup_errors", "0");
+          @error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT);
+
+          // Try to use OpenCart session name; fall back to default if unknown
+          $names = ["OCSESSID", ini_get("session.name") ?: "PHPSESSID"];
+          $names = array_unique(array_filter($names));
+          foreach ($names as $n) {
+            if (session_status() === PHP_SESSION_ACTIVE) break;
+            @session_name($n);
+            @session_start();
+          }
+  
+          // Ensure a default currency exists very early
+          if (session_status() === PHP_SESSION_ACTIVE) {
+            if (empty($_SESSION["currency"]) || !is_string($_SESSION["currency"])) {
+              $_SESSION["currency"] = getenv("OC_DEFAULT_CURRENCY") ?: "USD";
+            }
+          }
+          PHP
+            chmod 644 "$PREPEND"
+            INI_DIR="$(php -i | sed -n "s/^Scan this dir for additional \.ini files => //p")"
+            [ -d "$INI_DIR" ] || INI_DIR="/usr/local/etc/php/conf.d"
+            echo "auto_prepend_file = $PREPEND" >> "$INI_DIR/999-testrigor.ini"
+            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
+              [ -d "$root" ] || continue
+              echo "auto_prepend_file = $PREPEND" >> "$root/.user.ini"
             done
           '
 
@@ -260,20 +292,11 @@ jobs:
             || { echo '::warning::OpenCart tables missing; installation likely failed early.'; exit 0; }
 
           docker compose exec -T "$DB_SVC" sh -lc '
-            set -e
             DB_CLI=$(command -v mysql || command -v mariadb)
-            DB_HOST="'"$DB_HOST_LOCAL"'"
-            DB_PORT="'"$DB_PORT"'"
-            DB_NAME="'"$DB_NAME"'"
-            DB_USER="'"$DB_USER"'"
-            DB_PASS="'"$DB_PASS"'"
-            PFX="'"$PREFIX"'"
-
             cat > /tmp/upsert.sql <<'"'"'SQL'"'"'
           UPDATE __PFX__setting
              SET value='\''USD'\''
            WHERE code='\''config'\'' AND `key`='\''config_currency'\'';
-
           INSERT INTO __PFX__setting (store_id, code, `key`, value)
           SELECT 0, '\''config'\'', '\''config_currency'\'', '\''USD'\''
           WHERE NOT EXISTS (
@@ -281,73 +304,78 @@ jobs:
              WHERE code='\''config'\'' AND `key`='\''config_currency'\''
           );
           SQL
-            sed -i "s/__PFX__/${PFX}/g" /tmp/upsert.sql
-            $DB_CLI -h "$DB_HOST" -P "$DB_PORT" -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" < /tmp/upsert.sql
+            sed -i "s/__PFX__/'"$PREFIX"'/g" /tmp/upsert.sql
+            $DB_CLI -h 127.0.0.1 -P '"$DB_PORT"' -u"'"$DB_USER"'" -p"'"$DB_PASS"'" "'"$DB_NAME"'" < /tmp/upsert.sql
           '
 
-      - name: Force-set session currency on every request (auto_prepend_file)
+      - name: Harden all currency reads project-wide
         shell: bash
         run: |
           set -euo pipefail
-          docker compose exec -T "$PHP_SVC" bash -lc '
-            set -e
-            PREPEND="/usr/local/etc/php/testrigor-prepend.php"
-            cat > "$PREPEND" <<'"'"'PHP'"'"'
+          cat >/tmp/patch_currency_tree.php <<'PHP'
           <?php
-          if (PHP_SAPI !== "cli") {
-            if (function_exists("session_status") && session_status() === PHP_SESSION_NONE) { @session_start(); }
-            if (empty($_SESSION["currency"])) {
-              $_SESSION["currency"] = getenv("OC_DEFAULT_CURRENCY") ?: "USD";
+          $roots = ['/var/www/html/upload', '/var/www/upload'];
+          $changed = 0;
+
+          function files_php($root) {
+            if (!is_dir($root)) return [];
+            $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS));
+            $out = [];
+            foreach ($rii as $f) {
+              if ($f->isFile() && strtolower($f->getExtension()) === 'php') {
+                $out[] = $f->getPathname();
+              }
+            }
+            return $out;
+          }
+
+          function safe_write($path, $content) {
+            @chmod($path, 0664);
+            return (file_put_contents($path, $content) !== false);
+          }
+
+          $pattern = '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$this->session->data\[[\'"]currency[\'"]\])/i';
+          $replacement = "(\$this->session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')";
+
+          foreach ($roots as $r) {
+            // Patch specific controller with a defensive default at top of index()
+            $c1 = "$r/catalog/controller/common/currency.php";
+            if (is_file($c1)) {
+              $src = file_get_contents($c1);
+              if ($src !== false && strpos($src, "defensive default for currency") === false) {
+                $src = preg_replace(
+                  '/(public\s+function\s+index\s*\(\s*\)\s*\{\s*\$this->load->language\(.*?\);\s*)/s',
+                  "$1\n    // defensive default for currency\n    if (!isset(\$this->session->data['currency']) || !is_string(\$this->session->data['currency']) || \$this->session->data['currency'] === '') {\n        \$this->session->data['currency'] = \$this->config->get('config_currency') ?: 'USD';\n    }\n",
+                  $src,
+                  1,
+                  $cntLocal
+                );
+                if ($cntLocal > 0 && safe_write($c1, $src)) {
+                  echo "Hardened controller: $c1\n";
+                  $changed++;
+                }
+              }
+            }
+
+            // Replace raw reads across controllers/models/views
+            foreach (files_php($r) as $file) {
+              $src = file_get_contents($file);
+              if ($src === false) continue;
+              $new = preg_replace($pattern, $replacement, $src, -1, $count);
+              if ($count > 0 && $new !== null && $new !== $src) {
+                if (safe_write($file, $new)) {
+                  echo "Patched $count occurence(s): $file\n";
+                  $changed += $count;
+                }
+              }
             }
           }
-          PHP
-            chmod 644 "$PREPEND"
-
-            INI_DIR="$(php -i | sed -n "s/^Scan this dir for additional \.ini files => //p")"
-            [ -d "$INI_DIR" ] || INI_DIR="/usr/local/etc/php/conf.d"
-            {
-              echo ""; echo "; Ensure prepend runs before app to set session currency";
-              echo "auto_prepend_file = $PREPEND";
-            } >> "$INI_DIR/999-testrigor.ini"
-
-            for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
-              [ -d "$root" ] || continue
-              echo "auto_prepend_file = $PREPEND" >> "$root/.user.ini"
-            done
-
-            php -i | egrep "additional .ini|999-testrigor.ini|auto_prepend_file" || true
-          '
-
-      # --------- CHANGED STEP: write PHP locally, docker cp into container, then run ---------
-      - name: Patch controller to be currency-safe (defensive)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Write the PHP patch file on the runner (no nested quoting issues)
-          cat >/tmp/patch_currency.php <<'PHP'
-          <?php
-          $paths = [  
-            "/var/www/html/upload/catalog/controller/product/thumb.php",
-            "/var/www/upload/catalog/controller/product/thumb.php"
-          ];
-          foreach ($paths as $f) {
-            if (!is_file($f)) continue;
-            @chmod($f, 0664); // ensure writable, ignore errors
-            $src = file_get_contents($f);
-            $re  = '/\$this->session->data\[[\'"]currency[\'"]\]/';
-            $rep = "(\$this->session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')";
-            $new = preg_replace($re, $rep, $src);
-            if ($new !== null && $new !== $src) {
-              file_put_contents($f, $new);
-              echo "Patched: $f\n";
-            } else {
-              echo "No change (already safe): $f\n";
-            }
-          }
+    
+          echo "Total replacements: $changed\n";
           PHP
           CID="$(docker compose ps -q "$PHP_SVC")"
-          docker cp /tmp/patch_currency.php "$CID":/tmp/patch_currency.php
-          docker compose exec -T "$PHP_SVC" php /tmp/patch_currency.php
+          docker cp /tmp/patch_currency_tree.php "$CID":/tmp/patch_currency_tree.php
+          docker compose exec -T "$PHP_SVC" php /tmp/patch_currency_tree.php
 
       - name: Wait for OpenCart to be reachable
         shell: bash
