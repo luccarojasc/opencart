@@ -221,7 +221,7 @@ jobs:
           display_startup_errors = Off
           log_errors = On
           error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
-          EOF
+          EOF  
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               [ -d "$root" ] || continue
               cat > "$root/.user.ini" <<'INI'
@@ -232,6 +232,7 @@ jobs:
             done
           '
 
+      # UPDATED: stronger global handler + prepend file
       - name: Force-set default currency very early (auto_prepend_file)
         shell: bash
         run: |
@@ -241,12 +242,19 @@ jobs:
             PREPEND="/usr/local/etc/php/testrigor-prepend.php"
             cat > "$PREPEND" <<'"'"'PHP'"'"'
           <?php
-          // Make sure errors never print to browser even if .ini is ignored
           @ini_set("display_errors", "0");
           @ini_set("display_startup_errors", "0");
           @error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT);
 
-          // Try to use OpenCart session name; fall back to default if unknown
+          // swallow notices/warnings/deprecated so a page never turns into plain text
+          set_error_handler(function($errno, $errstr, $errfile, $errline) {
+            if (in_array($errno, [E_NOTICE, E_WARNING, E_DEPRECATED, E_USER_NOTICE, E_USER_WARNING, E_USER_DEPRECATED])) {
+              return true; // handled
+            }
+            return false; // let fatals/parse errors bubble
+          });
+
+          // OpenCart session name first, then default
           $names = ["OCSESSID", ini_get("session.name") ?: "PHPSESSID"];
           $names = array_unique(array_filter($names));
           foreach ($names as $n) {
@@ -254,8 +262,8 @@ jobs:
             @session_name($n);
             @session_start();
           }
-  
-          // Ensure a default currency exists very early
+
+          // default currency
           if (session_status() === PHP_SESSION_ACTIVE) {
             if (empty($_SESSION["currency"]) || !is_string($_SESSION["currency"])) {
               $_SESSION["currency"] = getenv("OC_DEFAULT_CURRENCY") ?: "USD";
@@ -263,12 +271,24 @@ jobs:
           }
           PHP
             chmod 644 "$PREPEND"
+
             INI_DIR="$(php -i | sed -n "s/^Scan this dir for additional \.ini files => //p")"
             [ -d "$INI_DIR" ] || INI_DIR="/usr/local/etc/php/conf.d"
-            echo "auto_prepend_file = $PREPEND" >> "$INI_DIR/999-testrigor.ini"
+            cat >> "$INI_DIR/999-testrigor.ini" <<EOF
+          display_errors = Off
+          display_startup_errors = Off
+          log_errors = On
+          error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
+          auto_prepend_file = $PREPEND
+          EOF
             for root in /var/www/html/upload /var/www/upload /var/www/html /var/www; do
               [ -d "$root" ] || continue
-              echo "auto_prepend_file = $PREPEND" >> "$root/.user.ini"
+              cat >> "$root/.user.ini" <<INI
+          display_errors = 0
+          display_startup_errors = 0
+          error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
+          auto_prepend_file = $PREPEND
+          INI
             done
           '
 
@@ -308,6 +328,7 @@ jobs:
             $DB_CLI -h 127.0.0.1 -P '"$DB_PORT"' -u"'"$DB_USER"'" -p"'"$DB_PASS"'" "'"$DB_NAME"'" < /tmp/upsert.sql
           '
 
+      # UPDATED: broader hardening (includes $_SESSION and a direct guard in product/thumb.php)
       - name: Harden all currency reads project-wide
         shell: bash
         run: |
@@ -315,63 +336,55 @@ jobs:
           cat >/tmp/patch_currency_tree.php <<'PHP'
           <?php
           $roots = ['/var/www/html/upload', '/var/www/upload'];
-          $changed = 0;
+          $total = 0;
 
-          function files_php($root) {
+          function php_files($root) {
             if (!is_dir($root)) return [];
-            $rii = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS));
+            $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS));
             $out = [];
-            foreach ($rii as $f) {
-              if ($f->isFile() && strtolower($f->getExtension()) === 'php') {
-                $out[] = $f->getPathname();
-              }
-            }
+            foreach ($it as $f) if ($f->isFile() && strtolower($f->getExtension()) === 'php') $out[] = $f->getPathname();
             return $out;
           }
+          function write_file($f, $s) { @chmod($f, 0664); return file_put_contents($f, $s) !== false; }
 
-          function safe_write($path, $content) {
-            @chmod($path, 0664);
-            return (file_put_contents($path, $content) !== false);
-          }
-
-          $pattern = '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$this->session->data\[[\'"]currency[\'"]\])/i';
-          $replacement = "(\$this->session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')";
+          $re = [
+            '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$this->s\s*e\s*s\s*s\s*i\s*o\s*n\s*->\s*data\s*\[\s*[\'"]currency[\'"]\s*\])/ix'
+              => "(\$this->session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')",
+            '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$session\s*->\s*data\s*\[\s*[\'"]currency[\'"]\s*\])/i'
+              => "(\$session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')",
+            '/(?<!isset\s*\(|empty\s*\(|unset\s*\()(\$_SESSION\s*\[\s*[\'"]currency[\'"]\s*\])/i'
+              => "(\$_SESSION['currency'] ?? 'USD')",
+          ];
 
           foreach ($roots as $r) {
-            // Patch specific controller with a defensive default at top of index()
-            $c1 = "$r/catalog/controller/common/currency.php";
-            if (is_file($c1)) {
-              $src = file_get_contents($c1);
-              if ($src !== false && strpos($src, "defensive default for currency") === false) {
+            // Direct guard in product/thumb.php
+            $thumb = "$r/catalog/controller/product/thumb.php";
+            if (is_file($thumb)) {
+              $src = file_get_contents($thumb);
+              if ($src !== false && strpos($src, '__TR_CURRENCY_GUARD__') === false) {
                 $src = preg_replace(
-                  '/(public\s+function\s+index\s*\(\s*\)\s*\{\s*\$this->load->language\(.*?\);\s*)/s',
-                  "$1\n    // defensive default for currency\n    if (!isset(\$this->session->data['currency']) || !is_string(\$this->session->data['currency']) || \$this->session->data['currency'] === '') {\n        \$this->session->data['currency'] = \$this->config->get('config_currency') ?: 'USD';\n    }\n",
-                  $src,
-                  1,
-                  $cntLocal
+                  '/(<\?php)/',
+                  "$0\n// __TR_CURRENCY_GUARD__\nif (!isset(\$this->session->data['currency']) || !is_string(\$this->session->data['currency']) || \$this->session->data['currency'] === '') {\n    \$this->session->data['currency'] = \$this->config->get('config_currency') ?: 'USD';\n}\n",
+                $src, 1, $cnt
                 );
-                if ($cntLocal > 0 && safe_write($c1, $src)) {
-                  echo "Hardened controller: $c1\n";
-                  $changed++;
-                }
+                if ($cnt && write_file($thumb, $src)) echo "Inserted guard: $thumb\n";
               }
             }
 
-            // Replace raw reads across controllers/models/views
-            foreach (files_php($r) as $file) {
-              $src = file_get_contents($file);
-              if ($src === false) continue;
-              $new = preg_replace($pattern, $replacement, $src, -1, $count);
-              if ($count > 0 && $new !== null && $new !== $src) {
-                if (safe_write($file, $new)) {
-                  echo "Patched $count occurence(s): $file\n";
-                  $changed += $count;
-                }
+            foreach (php_files($r) as $f) {
+              $src = file_get_contents($f); if ($src === false) continue;
+              $countFile = 0;
+              foreach ($re as $pat => $rep) {
+                $src = preg_replace($pat, $rep, $src, -1, $c);
+                $countFile += (int)$c;
+              }
+              if ($countFile > 0 && write_file($f, $src)) {
+                echo "Patched $countFile read(s): $f\n";
+                $total += $countFile;
               }
             }
           }
-    
-          echo "Total replacements: $changed\n";
+          echo "TOTAL replacements: $total\n";
           PHP
           CID="$(docker compose ps -q "$PHP_SVC")"
           docker cp /tmp/patch_currency_tree.php "$CID":/tmp/patch_currency_tree.php
