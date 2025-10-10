@@ -56,7 +56,7 @@ jobs:
           echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
           echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
 
-          # Optional CLI installer path (if present in your image)
+          # Optional CLI installer path (if present)
           INSTALLER=""
           for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php; do
             if docker compose exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
@@ -274,7 +274,7 @@ jobs:
           UPDATE __PFX__setting
              SET value='\''USD'\''
            WHERE code='\''config'\'' AND `key`='\''config_currency'\'';
-          
+
           INSERT INTO __PFX__setting (store_id, code, `key`, value)
           SELECT 0, '\''config'\'', '\''config_currency'\'', '\''USD'\''
           WHERE NOT EXISTS (
@@ -323,21 +323,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker compose exec -T "$PHP_SVC" sh -lc '
-            php -r "
-              \$paths = [
-                \"/var/www/html/upload/catalog/controller/product/thumb.php\",
-                \"/var/www/upload/catalog/controller/product/thumb.php\"
-              ];
-              foreach (\$paths as \$f) {
-                if (!is_file(\$f)) continue;
-                \$src = file_get_contents(\$f);
-                \$re  = '/\\$this->session->data\\[[\\\"\\\']currency[\\\"\\\']\\]/';
-                \$rep = \"(\\$this->session->data['currency'] ?? \\$this->config->get('config_currency') ?: 'USD')\";
-                \$new = preg_replace(\$re, \$rep, \$src);
-                if (\$new !== null && \$new !== \$src) { file_put_contents(\$f, \$new); echo \"Patched: \$f\\n\"; }
-              }
-            "
+          docker compose exec -T "$PHP_SVC" bash -lc '
+            set -e
+            cat >/tmp/patch_currency.php <<'"'"'PHP'"'"'
+          <?php
+          $paths = [
+            "/var/www/html/upload/catalog/controller/product/thumb.php",
+            "/var/www/upload/catalog/controller/product/thumb.php"
+          ];
+          foreach ($paths as $f) {
+            if (!is_file($f)) continue;
+            $src = file_get_contents($f);
+            $re  = '/\$this->session->data\[[\'"]currency[\'"]\]/';
+            $rep = "(\$this->session->data['currency'] ?? \$this->config->get('config_currency') ?: 'USD')";
+            $new = preg_replace($re, $rep, $src);
+            if ($new !== null && $new !== $src) {
+              file_put_contents($f, $new);
+              echo "Patched: $f\n";
+            }
+          }
+          PHP
+            php /tmp/patch_currency.php
           '
 
       - name: Wait for OpenCart to be reachable
