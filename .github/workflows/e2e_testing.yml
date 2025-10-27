@@ -14,22 +14,70 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Start OpenCart using the repo's docker-compose
+      # If the repo doesn't ship a compose file, create a minimal one.
+      - name: Ensure docker-compose.yml exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f docker-compose.yml ]; then
+            echo "No docker-compose.yml found; generating a minimal one (OpenCart + MariaDB)."
+            cat > docker-compose.yml <<'YAML'
+version: "3.8"
+services:
+  db:
+    image: mariadb:10.6
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: opencart
+      MARIADB_USER: oc
+      MARIADB_PASSWORD: ocpass
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$MARIADB_USER -p$MARIADB_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  opencart:
+    image: bitnami/opencart:latest
+    environment:
+      OPENCART_HOST: localhost
+      OPENCART_USERNAME: admin
+      OPENCART_PASSWORD: admin123
+      OPENCART_EMAIL: admin@example.com
+      MARIADB_HOST: db
+      MARIADB_PORT_NUMBER: 3306
+      MARIADB_DATABASE: opencart
+      MARIADB_USER: oc
+      MARIADB_PASSWORD: ocpass
+      ALLOW_EMPTY_PASSWORD: "yes"
+    depends_on:
+      - db
+    ports:
+      - "8080:8080"
+YAML
+          fi
+          echo "----- docker-compose.yml -----"
+          cat docker-compose.yml
+          echo "------------------------------"
+
       - name: Start OpenCart (docker-compose)
         run: |
           docker compose -f docker-compose.yml up -d --remove-orphans
-          docker compose ps
+          docker compose -f docker-compose.yml ps
 
       # Detect which port is published and export LOCAL_BASE_URL for later steps
       - name: Detect OpenCart URL
         shell: bash
         run: |
-          if curl -fsSI http://localhost >/dev/null; then
-            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
-          elif curl -fsSI http://localhost:8080 >/dev/null; then
+          if curl -fsSI http://localhost:8080 >/dev/null; then
             echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
-          else
+          elif curl -fsSI http://localhost >/dev/null; then
             echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
+          else
+            # Default to 8080 since our generated compose maps 8080:8080
+            echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
           fi
 
       - name: Wait for OpenCart to be reachable
@@ -44,6 +92,9 @@ jobs:
             sleep 5
           done
           echo "OpenCart failed to start in time" >&2
+          echo "::group::Recent container logs"
+          docker compose -f docker-compose.yml logs --no-color --tail=200 || true
+          echo "::endgroup::"
           exit 1
 
       - name: Verify HTTP headers (sanity)
@@ -69,7 +120,6 @@ jobs:
         run: |
           echo "Suite ID: $TESTRIGOR_SUITE_ID"
           echo "URL:      $LOCAL_BASE_URL"
-          # Use npx to ensure the correct CLI binary/version is used
           npx -y testrigor-cli test-suite run "$TESTRIGOR_SUITE_ID" \
             --token "$TESTRIGOR_CI_TOKEN" \
             --localhost --url "$LOCAL_BASE_URL" \
