@@ -3,7 +3,6 @@ name: testRigor E2E on OpenCart (localhost)
 on:
   push:
     branches: ["**"]
-  workflow_dispatch:
 
 jobs:
   e2e:
@@ -15,347 +14,54 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # NEW: generate a minimal docker-compose + Dockerfile if your repo doesn't have one
-      - name: Ensure docker-compose.yml (generate if missing)
+      # Start OpenCart using the repo's docker-compose
+      - name: Start OpenCart (docker-compose)
+        run: |
+          docker compose -f docker-compose.yml up -d --remove-orphans
+          docker compose ps
+
+      # Detect which port is published and export LOCAL_BASE_URL for later steps
+      - name: Detect OpenCart URL
         shell: bash
         run: |
-          set -euo pipefail
-          if [ ! -f docker-compose.yml ]; then
-            echo "No docker-compose.yml found. Generating a minimal one for OpenCart."
-            mkdir -p .github
-            cat > .github/opencart.Dockerfile <<'DOCKER'
-          FROM php:8.2-apache
-
-          RUN apt-get update && \
-              apt-get install -y --no-install-recommends \
-                libpng-dev libjpeg-dev libfreetype6-dev \
-                libzip-dev libicu-dev libxml2-dev zlib1g-dev \
-                libonig-dev unzip git curl && \
-              docker-php-ext-configure gd --with-freetype --with-jpeg && \
-              docker-php-ext-install -j"$(nproc)" mysqli gd zip intl xml mbstring && \
-              a2enmod rewrite && \
-              rm -rf /var/lib/apt/lists/*
-          DOCKER
-
-            cat > docker-compose.yml <<'YAML'
-version: "3.8"
-services:
-  mysql:
-    image: mariadb:10.6
-    environment:
-      MARIADB_DATABASE: opencart
-      MARIADB_USER: oc_user
-      MARIADB_PASSWORD: Password#123!
-      MARIADB_ROOT_PASSWORD: rootpw
-    ports:
-      - "3306:3306"
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-
-  php:
-    build:
-      context: .
-      dockerfile: .github/opencart.Dockerfile
-    depends_on:
-      - mysql
-    ports:
-      - "8080:80"
-    volumes:
-      # Serve OpenCart from ./upload as webroot
-      - ./upload:/var/www/html
-          YAML
-          fi
-
-          echo "Using docker-compose.yml:"
-          echo "--------------------------------"
-          cat docker-compose.yml
-          echo "--------------------------------"
-
-      - name: Start services (docker-compose)
-        run: |
-          docker compose -f docker-compose.yml up -d --build --remove-orphans --quiet-pull
-          docker compose -f docker-compose.yml ps
-
-      - name: Detect services and URL
-        shell: bash
-        run: |
-          set -euo pipefail
-          # We generated services named php and mysql above; autodetect anyway.
-          WEB_SVC="php"   # this container exposes Apache
-          PHP_SVC="php"
-          DB_SVC="mysql"
-
-          # Confirm exist / fallback
-          for svc in "$WEB_SVC" "$PHP_SVC" "$DB_SVC"; do
-            if ! docker compose -f docker-compose.yml ps --services | grep -qx "$svc"; then
-              echo "::error::$svc service not found in compose"; docker compose -f docker-compose.yml ps; exit 1
-            fi
-          done
-
-          echo "WEB_SVC=$WEB_SVC" >> "$GITHUB_ENV"
-          echo "PHP_SVC=$PHP_SVC" >> "$GITHUB_ENV"
-          echo "DB_SVC=$DB_SVC"   >> "$GITHUB_ENV"
-
-          # Optional CLI installer path (some repos may include it)
-          INSTALLER=""
-          for p in /var/www/upload/install/cli_install.php /var/www/html/upload/install/cli_install.php /var/www/html/install/cli_install.php; do
-            if docker compose -f docker-compose.yml exec -T "$PHP_SVC" sh -lc "test -f $p"; then INSTALLER="$p"; break; fi
-          done
-          echo "INSTALLER=$INSTALLER" >> "$GITHUB_ENV"
-
-          # Local base URL from published port
-          PORT="$(docker compose -f docker-compose.yml port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
-          if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
+          if curl -fsSI http://localhost >/dev/null; then
             echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
+          elif curl -fsSI http://localhost:8080 >/dev/null; then
+            echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
           else
-            echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
+            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           fi
-
-      - name: Wait for DB to be ready
-        shell: bash
-        run: |
-          set -euo pipefail
-          CID="$(docker compose -f docker-compose.yml ps -q "$DB_SVC")"
-          [ -z "$CID" ] && { echo "::error::Cannot find DB container for $DB_SVC"; docker compose -f docker-compose.yml ps; exit 1; }
-          echo "Waiting for DB container ($DB_SVC)…"
-          for i in {1..60}; do
-            STATUS="$(docker inspect -f '{{.State.Health.Status}}' "$CID" 2>/dev/null || echo unknown)"
-            if [ "$STATUS" = "healthy" ]; then echo "DB healthy"; break; fi
-            echo "DB health: $STATUS ($i/60)"; sleep 2
-            if [ "$i" -eq 60 ]; then
-              echo "::warning::Healthcheck timeout; trying mysqladmin ping…"
-              docker compose -f docker-compose.yml exec -T "$DB_SVC" sh -lc \
-                "mysqladmin ping -h 127.0.0.1 --silent || \
-                 mysqladmin ping -h 127.0.0.1 -uroot --silent || \
-                 mysqladmin ping -h 127.0.0.1 -uroot -p\${MYSQL_ROOT_PASSWORD:-\${MARIADB_ROOT_PASSWORD:-}} --silent" \
-                || { echo '::error::DB did not respond to mysqladmin ping'; docker compose -f docker-compose.yml logs --no-color --tail=200 "$DB_SVC" || true; exit 1; }
-              break
-            fi
-          done
-
-      - name: Prepare config files and permissions
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose -f docker-compose.yml exec -T "$PHP_SVC" sh -lc '
-            set -e
-            ROOT=""
-            for b in /var/www/html /var/www; do
-              if [ -f "$b/config-dist.php" ] || [ -f "$b/config.php" ]; then
-                # For our generated compose, upload/ is mounted as /var/www/html already
-                ROOT="$b"
-                break
-              fi
-            done
-            [ -z "$ROOT" ] && { echo "Cannot locate webroot"; exit 1; }
-            # In the generated compose, config files live directly under webroot
-            cp -n "$ROOT/config-dist.php" "$ROOT/config.php" || true
-            mkdir -p "$ROOT/admin"
-            cp -n "$ROOT/admin/config-dist.php" "$ROOT/admin/config.php" || true
-            chmod 666 "$ROOT/config.php" "$ROOT/admin/config.php" || true
-            chown -R www-data:www-data "$ROOT" || true
-          '
-
-      - name: Install OpenCart via CLI (if present)
-        if: env.INSTALLER != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          DB_ENV="$(docker compose -f docker-compose.yml exec -T "$DB_SVC" sh -lc 'env' || true)"
-          getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
-          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
-          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
-          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
-          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
-          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
-          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
-          : "${DB_NAME:=opencart}"
-
-          docker compose -f docker-compose.yml exec -T "$PHP_SVC" sh -lc "php -d display_errors=1 -d error_reporting=32767 '$INSTALLER' install \
-            --db_hostname '$DB_HOST' \
-            --db_username '$DB_USER' \
-            --db_password '$DB_PASS' \
-            --db_database '$DB_NAME' \
-            --db_driver mysqli \
-            --db_port '$DB_PORT' \
-            --username admin \
-            --password admin123 \
-            --email admin@example.com \
-            --http_server '${LOCAL_BASE_URL%/}/'"
-
-          docker compose -f docker-compose.yml exec -T "$PHP_SVC" sh -lc 'rm -rf /var/www/html/install 2>/dev/null || true'
-
-      - name: Finalize base URLs and DB settings in configs (safe PHP patch)
-        shell: bash
-        run: |
-          set -euo pipefail
-          DB_ENV="$(docker compose -f docker-compose.yml exec -T "$DB_SVC" sh -lc 'env' || true)"
-          getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
-          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
-          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
-          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
-          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
-          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
-          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
-          : "${DB_NAME:=opencart}"
-
-          cat <<'PHP' | docker compose -f docker-compose.yml exec -T \
-            -e LOCAL_BASE_URL="$LOCAL_BASE_URL" \
-            -e DB_HOST="$DB_HOST" -e DB_PORT="$DB_PORT" \
-            -e DB_NAME="$DB_NAME" -e DB_USER="$DB_USER" -e DB_PASS="$DB_PASS" \
-            "$PHP_SVC" bash -lc 'cat > /tmp/oc_cfg_patch.php && php /tmp/oc_cfg_patch.php'
-          <?php
-          $base = "/var/www/html";
-          $cfgApp = "$base/config.php";
-          $cfgAdm = "$base/admin/config.php";
-
-          $http = rtrim(getenv("LOCAL_BASE_URL") ?: "http://localhost", "/") . "/";
-          $db = [
-            "host" => getenv("DB_HOST") ?: "localhost",
-            "port" => getenv("DB_PORT") ?: "3306",
-            "name" => getenv("DB_NAME") ?: "opencart",
-            "user" => getenv("DB_USER") ?: "root",
-            "pass" => getenv("DB_PASS") ?: "",
-          ];
-
-          function rewriteCfg($file, $base, $http, $db) {
-            if (!is_file($file)) return;
-            $c = file_get_contents($file);
-            $map = [
-              "/define\\('HTTP_SERVER'.*/"     => "define('HTTP_SERVER', '$http');",
-              "/define\\('HTTP_CATALOG'.*/"    => "define('HTTP_CATALOG', '$http');",
-              "/define\\('DIR_APPLICATION'.*/" => "define('DIR_APPLICATION', '{$base}/catalog/');",
-              "/define\\('DIR_SYSTEM'.*/"      => "define('DIR_SYSTEM', '{$base}/system/');",
-              "/define\\('DIR_IMAGE'.*/"       => "define('DIR_IMAGE', '{$base}/image/');",
-              "/define\\('DB_DRIVER'.*/"       => "define('DB_DRIVER', 'mysqli');",
-              "/define\\('DB_HOSTNAME'.*/"     => "define('DB_HOSTNAME', '{$db['host']}');",
-              "/define\\('DB_USERNAME'.*/"     => "define('DB_USERNAME', '{$db['user']}');",
-              "/define\\('DB_PASSWORD'.*/"     => "define('DB_PASSWORD', '{$db['pass']}');",
-              "/define\\('DB_DATABASE'.*/"     => "define('DB_DATABASE', '{$db['name']}');",
-              "/define\\('DB_PORT'.*/"         => "define('DB_PORT', '{$db['port']}');",
-              "/define\\('DB_PREFIX'.*/"       => "define('DB_PREFIX', 'oc_');",
-            ];    
-            foreach ($map as $re => $rep) { $c = preg_replace($re, $rep, $c); }
-            file_put_contents($file, $c);
-            echo "Patched: $file\n";
-          }
-
-          rewriteCfg($cfgApp, $base, $http, $db);
-          rewriteCfg($cfgAdm, $base, $http, $db);
-          PHP
-
-      - name: Silence PHP notices globally (.user.ini)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose -f docker-compose.yml exec -T "$PHP_SVC" bash -lc '
-            root=/var/www/html
-            cat > "$root/.user.ini" <<'"'"'INI'"'"'
-          display_errors = 0
-          display_startup_errors = 0
-          error_reporting = E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT
-          INI
-            echo "Wrote $root/.user.ini"
-          '
-
-      - name: Force disable display_errors in entrypoints
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker compose -f docker-compose.yml exec -T "$PHP_SVC" bash -lc '
-            for idx in /var/www/html/index.php /var/www/html/admin/index.php; do
-              [ -f "$idx" ] || continue
-              sed -i "1s|<?php|<?php @ini_set('\''display_errors'\'',0); @ini_set('\''display_startup_errors'\'',0); error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING & ~E_DEPRECATED & ~E_STRICT); |" "$idx"
-              head -n 1 "$idx"
-            done
-          '
-
-      - name: Ensure default currency set (USD) in DB
-        shell: bash
-        run: |
-          set -euo pipefail
-          PREFIX="${DB_PREFIX:-oc_}"
-          DB_ENV="$(docker compose -f docker-compose.yml exec -T "$DB_SVC" sh -lc 'env' || true)"
-          getv() { echo "$DB_ENV" | awk -F= -v k="$1" 'index($0,k"=")==1{print substr($0,length(k)+2)}'; }
-          DB_HOST="$DB_SVC"; DB_PORT="${DB_PORT:-3306}"
-          DB_NAME="$(getv MYSQL_DATABASE)";   [ -z "$DB_NAME" ] && DB_NAME="$(getv MARIADB_DATABASE)"
-          DB_USER="$(getv MYSQL_USER)";       [ -z "$DB_USER" ] && DB_USER="$(getv MARIADB_USER)"
-          DB_PASS="$(getv MYSQL_PASSWORD)";   [ -z "$DB_PASS" ] && DB_PASS="$(getv MARIADB_PASSWORD)"
-          ROOT_PW="$(getv MYSQL_ROOT_PASSWORD)"; [ -z "$ROOT_PW" ] && ROOT_PW="$(getv MARIADB_ROOT_PASSWORD)"
-          if [ -z "$DB_USER" ]; then DB_USER="root"; DB_PASS="$ROOT_PW"; fi
-          : "${DB_NAME:=opencart}"
-
-          UPSERT_CCY="INSERT INTO ${PREFIX}setting (store_id, code, \`key\`, value)
-                      VALUES (0,'config','config_currency','USD')
-                      ON DUPLICATE KEY UPDATE value='USD';"
-          docker compose -f docker-compose.yml exec -T "$DB_SVC" sh -lc \
-            "mysql -h $DB_HOST -P $DB_PORT -u'$DB_USER' -p'$DB_PASS' '$DB_NAME' -e \"$UPSERT_CCY\"" || true
-
-      - name: Patch currency reads with default fallback
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat <<'PHP' | docker compose -f docker-compose.yml exec -T "$PHP_SVC" bash -lc 'cat > /tmp/oc_currency_patch.php && php /tmp/oc_currency_patch.php'
-          <?php
-          $targets = [
-            "/var/www/html/catalog/controller/product/thumb.php",  // for our generated layout
-            "/var/www/html/upload/catalog/controller/product/thumb.php",
-            "/var/www/upload/catalog/controller/product/thumb.php",
-          ];
-
-          foreach ($targets as $f) {
-            if (!is_file($f)) continue;
-          
-            $c = file_get_contents($f);
-
-            // Match $this->session->data['currency'] (allow whitespace / both quote styles)
-            $pattern     = "/\\$this->session->data\\s*\\[\\s*['\"]currency['\"]\\s*\\]/";
-
-            // Single-quoted replacement => no PHP interpolation of $this
-            $replacement = '($this->session->data[\'currency\'] ?? $this->config->get(\'config_currency\'))';
-
-            $c = preg_replace($pattern, $replacement, $c, -1, $n);
-
-            if ($n > 0) {
-              file_put_contents($f, $c);
-              echo $f . ": " . $n . " replacement(s)\n";
-            } else {
-              echo $f . ": 0 replacement(s)\n";
-            }
-          }  
-          PHP
 
       - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
-          set -euo pipefail
-          for i in {1..90}; do
+          for i in {1..60}; do
             if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
-              echo "OpenCart is up at $LOCAL_BASE_URL"; exit 0
+              echo "OpenCart is up at $LOCAL_BASE_URL"
+              exit 0
             fi
-            echo "Waiting for OpenCart... ($i/90)"; sleep 3
+            echo "Waiting for OpenCart... ($i/60)"
+            sleep 5
           done
-          echo "::group::Recent container logs"
-          docker compose -f docker-compose.yml logs --no-color --tail=300 || true
-          echo "::endgroup::"
+          echo "OpenCart failed to start in time" >&2
           exit 1
 
       - name: Verify HTTP headers (sanity)
         run: curl -LI "$LOCAL_BASE_URL" || true
 
-      - name: Setup Node.js for testRigor CLI
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install testRigor CLI
+        run: npm i -g testrigor-cli
+
+      - name: Verify CLI is installed
         run: |
-          npm i -g testrigor-cli
+          which testrigor || true
           testrigor --version || true
-          npx -y testrigor-cli --version || true
+          npx -y testrigor-cli --version
 
       - name: Trigger testRigor suite against localhost
         env:
@@ -363,6 +69,7 @@ services:
         run: |
           echo "Suite ID: $TESTRIGOR_SUITE_ID"
           echo "URL:      $LOCAL_BASE_URL"
+          # Use npx to ensure the correct CLI binary/version is used
           npx -y testrigor-cli test-suite run "$TESTRIGOR_SUITE_ID" \
             --token "$TESTRIGOR_CI_TOKEN" \
             --localhost --url "$LOCAL_BASE_URL" \
