@@ -3,6 +3,7 @@ name: testRigor E2E on OpenCart (localhost)
 on:
   push:
     branches: ["**"]
+  workflow_dispatch:
 
 jobs:
   e2e:
@@ -14,15 +15,14 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Create a minimal docker-compose.yml if the repo doesn't have one.
-      - name: Ensure docker-compose.yml exists
+      # 1) Create docker-compose.yml if the repo doesn't provide one
+      - name: Generate docker-compose.yml if missing
         shell: bash
         run: |
           set -euo pipefail
           if [ ! -f docker-compose.yml ]; then
-            echo "No docker-compose.yml found; generating a minimal one (OpenCart + MariaDB)."
-            cat > docker-compose.yml <<-'YAML'
-              version: "3.8"
+            echo "No docker-compose.yml found. Writing a default one…"
+            cat > docker-compose.yml <<'YAML'
             services:
               db:
                 image: mariadb:10.6
@@ -34,10 +34,10 @@ jobs:
                 ports:
                   - "3306:3306"
                 healthcheck:
-                  test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$MARIADB_USER -p$MARIADB_PASSWORD --silent"]
-                  interval: 5s
-                  timeout: 3s
-                  retries: 30
+                  test: ["CMD-SHELL","mysqladmin ping -h 127.0.0.1 -uroot -proot --silent || exit 1"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 10
 
               opencart:
                 image: bitnami/opencart:latest
@@ -56,54 +56,113 @@ jobs:
                   - db
                 ports:
                   - "8080:8080"
-          YAML
+            YAML
           fi
 
-          echo "----- docker-compose.yml -----"
-          cat docker-compose.yml
-          echo "------------------------------"
-
-      - name: Start OpenCart (docker-compose)
+      # 2) Normalize the compose file (BOM/CRLF & remove legacy 'version')
+      - name: Normalize docker-compose.yml (BOM/CRLF & legacy version)
+        if: ${{ hashFiles('docker-compose.yml') != '' }}
+        shell: bash
         run: |
+          set -euo pipefail
+          # Remove BOM if present
+          sed -i '1s/^\xEF\xBB\xBF//' docker-compose.yml || true
+          # Convert CRLF to LF
+          sed -i 's/\r$//' docker-compose.yml
+          # Drop any legacy "version:" line; compose v2 ignores it anyway
+          awk '!/^[[:space:]]*version[[:space:]]*:/ {print}' docker-compose.yml > _dc.yml
+          mv _dc.yml docker-compose.yml
+          echo "----- head of docker-compose.yml -----"
+          sed -n '1,120p' docker-compose.yml
+          echo "--------------------------------------"
+
+      # 3) Validate compose; if invalid, replace with a known-good default
+      - name: Validate compose (fallback to default if invalid)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! docker compose -f docker-compose.yml config >/dev/null 2>&1; then
+            echo "::warning::Provided docker-compose.yml failed validation; replacing with default."
+            cat > docker-compose.yml <<'YAML'
+            services:
+              db:
+                image: mariadb:10.6
+                environment:
+                  MARIADB_ROOT_PASSWORD: root
+                  MARIADB_DATABASE: opencart
+                  MARIADB_USER: oc
+                  MARIADB_PASSWORD: ocpass
+                ports:
+                  - "3306:3306"
+                healthcheck:
+                  test: ["CMD-SHELL","mysqladmin ping -h 127.0.0.1 -uroot -proot --silent || exit 1"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 10
+
+              opencart:
+                image: bitnami/opencart:latest
+                environment:
+                  OPENCART_HOST: localhost
+                  OPENCART_USERNAME: admin
+                  OPENCART_PASSWORD: admin123
+                  OPENCART_EMAIL: admin@example.com
+                  MARIADB_HOST: db
+                  MARIADB_PORT_NUMBER: 3306
+                  MARIADB_DATABASE: opencart
+                  MARIADB_USER: oc
+                  MARIADB_PASSWORD: ocpass
+                  ALLOW_EMPTY_PASSWORD: "yes"
+                depends_on:
+                  - db
+                ports:
+                  - "8080:8080"
+            YAML
+          fi
+
+      # 4) Bring the stack up
+      - name: Start OpenCart (docker-compose)
+        shell: bash
+        run: |
+          set -euo pipefail
           docker compose -f docker-compose.yml up -d --remove-orphans
           docker compose -f docker-compose.yml ps
 
-      # Detect which port is published and export LOCAL_BASE_URL for later steps
+      # 5) Detect which port is live and export LOCAL_BASE_URL
       - name: Detect OpenCart URL
         shell: bash
         run: |
           if curl -fsSI http://localhost:8080 >/dev/null; then
             echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
-          elif curl -fsSI http://localhost >/dev/null; then
-            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           else
-            echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
+            echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           fi
+          echo "Using \$LOCAL_BASE_URL=$(grep LOCAL_BASE_URL \"$GITHUB_ENV\" | cut -d= -f2-)"
 
+      # 6) Wait until the site is reachable
       - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
-          for i in {1..60}; do
+          set -e
+          for i in {1..90}; do
             if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
-              echo "OpenCart is up at $LOCAL_BASE_URL"
-              exit 0
+              echo "OpenCart is up at $LOCAL_BASE_URL"; exit 0
             fi
-            echo "Waiting for OpenCart... ($i/60)"
-            sleep 5
+            echo "Waiting for OpenCart... ($i/90)"; sleep 3
           done
-          echo "OpenCart failed to start in time" >&2
           echo "::group::Recent container logs"
-          docker compose -f docker-compose.yml logs --no-color --tail=200 || true
+          docker compose logs --no-color --tail=200 || true
           echo "::endgroup::"
           exit 1
 
       - name: Verify HTTP headers (sanity)
         run: curl -LI "$LOCAL_BASE_URL" || true
 
+      # 7) Install & verify testRigor CLI
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: Install testRigor CLI
         run: npm i -g testrigor-cli
@@ -114,6 +173,7 @@ jobs:
           testrigor --version || true
           npx -y testrigor-cli --version
 
+      # 8) Trigger suite
       - name: Trigger testRigor suite against localhost
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
