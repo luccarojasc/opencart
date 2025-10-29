@@ -15,54 +15,52 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Create docker-compose.yml only if the repo doesn't have one.
-      # NOTE: The closing marker DCYAML must be the first characters of the line
-      # within the shell script (but still indented under `run: |` as shown).
       - name: Generate docker-compose.yml if missing (uses GHCR Bitnami image)
         shell: bash
         run: |
           set -euo pipefail
           if [ ! -f docker-compose.yml ]; then
-            cat > docker-compose.yml <<'DCYAML'
-            services:
-              db:
-                image: mariadb:10.6
-                environment:
-                  MARIADB_ROOT_PASSWORD: root
-                  MARIADB_DATABASE: opencart
-                  MARIADB_USER: oc
-                  MARIADB_PASSWORD: ocpass
-                ports:
-                  - "3306:3306"
-                healthcheck:
-                  test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MARIADB_USER} -p$${MARIADB_PASSWORD} || exit 1"]
-                  interval: 10s
-                  timeout: 5s
-                  retries: 10
+          cat <<'DCYAML' > docker-compose.yml
+services:
+  db:
+    image: mariadb:10.6
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: opencart
+      MARIADB_USER: oc
+      MARIADB_PASSWORD: ocpass
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MARIADB_USER} -p$${MARIADB_PASSWORD} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-              opencart:
-                image: ghcr.io/bitnami/opencart:latest
-                environment:
-                  OPENCART_HOST: localhost
-                  OPENCART_USERNAME: admin
-                  OPENCART_PASSWORD: admin123
-                  OPENCART_EMAIL: admin@example.com
-                  MARIADB_HOST: db
-                  MARIADB_PORT_NUMBER: 3306
-                  MARIADB_DATABASE: opencart
-                  MARIADB_USER: oc
-                  MARIADB_PASSWORD: ocpass
-                  ALLOW_EMPTY_PASSWORD: "yes"
-                ports:
-                  - "8080:8080"
-                depends_on:
-                  - db
-            DCYAML
+  opencart:
+    image: ghcr.io/bitnami/opencart:latest
+    environment:
+      OPENCART_HOST: localhost
+      OPENCART_USERNAME: admin
+      OPENCART_PASSWORD: admin123
+      OPENCART_EMAIL: admin@example.com
+      MARIADB_HOST: db
+      MARIADB_PORT_NUMBER: 3306
+      MARIADB_DATABASE: opencart
+      MARIADB_USER: oc
+      MARIADB_PASSWORD: ocpass
+      ALLOW_EMPTY_PASSWORD: "yes"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+          DCYAML
           fi
           echo "----- docker-compose.yml -----"
           sed -n '1,200p' docker-compose.yml
           echo "-----------------------------"
 
+      # Authenticate to GHCR so public pulls aren’t throttled
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
@@ -98,6 +96,7 @@ jobs:
           echo "::group::Recent docker logs"
           docker compose -f docker-compose.yml logs --no-color --tail=300 || true
           echo "::endgroup::"
+          echo "OpenCart failed to start in time" >&2
           exit 1
 
       - name: Verify HTTP headers (sanity)
