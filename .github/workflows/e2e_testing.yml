@@ -8,59 +8,113 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-latest
+
     env:
       # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
-      # OpenCart auto-install knobs (used by the php service in docker-compose)
+      # OpenCart admin defaults (used by fallback compose content)
       OPENCART_USERNAME: admin
       OPENCART_PASSWORD: admin123
       OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
-      OPENCART_HTTP_SERVER: http://localhost/   # compose uses this to set store URL
-      DB_DRIVER: mysqli
-      DB_HOSTNAME: mysql
-      DB_USERNAME: opencart
-      DB_PASSWORD: opencart
-      DB_DATABASE: opencart
-      DB_PORT: "3306"
-      DB_PREFIX: oc_
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Start services (docker-compose)
+      # Find an existing compose file or create a fallback (GHCR Bitnami images)
+      - name: Locate or create docker-compose file
+        id: compose
+        shell: bash
         run: |
-          docker compose -f docker-compose.yml up -d --build --remove-orphans --quiet-pull
-          docker compose ps
+          set -euo pipefail
+
+          # Try common compose filenames
+          for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+            if [ -f "$f" ]; then
+              echo "Found compose file: $f"
+              echo "COMPOSE_FILE=$f" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          echo "No compose file found. Writing fallback compose.yaml (Bitnami via GHCR)…"
+          cat > compose.yaml <<'YAML'
+          version: "3.9"
+          services:
+            mariadb:
+              image: ghcr.io/bitnami/mariadb:10.6
+              environment:
+                - MARIADB_ROOT_PASSWORD=root
+                - MARIADB_DATABASE=opencart
+                - MARIADB_USER=opencart
+                - MARIADB_PASSWORD=opencart
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "opencart", "-popencart"]
+                interval: 5s
+                timeout: 5s
+                retries: 20
+
+            opencart:
+              image: ghcr.io/bitnami/opencart:latest
+              depends_on:
+                - mariadb
+              environment:
+                - OPENCART_HOST=localhost
+                - OPENCART_USERNAME=${OPENCART_USERNAME}
+                - OPENCART_PASSWORD=${OPENCART_PASSWORD}
+                - OPENCART_EMAIL=${OPENCART_ADMIN_EMAIL}
+                - MARIADB_HOST=mariadb
+                - MARIADB_PORT_NUMBER=3306
+                - MARIADB_DATABASE=opencart
+                - MARIADB_USER=opencart
+                - MARIADB_PASSWORD=opencart
+                - ALLOW_EMPTY_PASSWORD=yes
+              # Bitnami exposes HTTP on 8080 by default
+              ports:
+                - "8080:8080"
+          YAML
+
+          echo "COMPOSE_FILE=compose.yaml" >> "$GITHUB_ENV"
+
+      - name: Start services (docker-compose)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Using compose file: $COMPOSE_FILE"
+          docker compose -f "$COMPOSE_FILE" up -d --build --remove-orphans --quiet-pull
+          docker compose -f "$COMPOSE_FILE" ps
 
       - name: Detect services and URL
         shell: bash
         run: |
           set -euo pipefail
-          # Choose the web service (commonly 'apache')
+
+          # Choose the web service name (if "apache" isn't present, take the first)
           WEB_SVC="apache"
-          if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
-            WEB_SVC="$(docker compose ps --services | head -n1)"
+          if ! docker compose -f "$COMPOSE_FILE" ps --services | grep -qx "$WEB_SVC"; then
+            WEB_SVC="$(docker compose -f "$COMPOSE_FILE" ps --services | head -n1)"
+          fi
+          echo "WEB_SVC=$WEB_SVC"
+
+          # Try to discover published port
+          PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
+          if [ -z "$PORT" ]; then
+            PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           fi
 
-          # Derive published HTTP port (80 or 8080)
-          PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
-          if [ -z "$PORT" ]; then
-            PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
-          fi
           if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
             echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           else
             echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
-          echo "Resolved LOCAL_BASE_URL=$(cat $GITHUB_ENV | grep LOCAL_BASE_URL | cut -d= -f2-)"
+
+          echo "Resolved LOCAL_BASE_URL=$(grep -E '^LOCAL_BASE_URL=' "$GITHUB_ENV" | tail -n1 | cut -d= -f2-)"
 
       - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
           set -e
-          # Allow auto-install in php container to finish; poll front page
           for i in {1..90}; do
             if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
               echo "OpenCart is up at $LOCAL_BASE_URL"
@@ -70,7 +124,7 @@ jobs:
             sleep 3
           done
           echo "::group::Recent container logs"
-          docker compose logs --no-color --tail=200
+          docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200
           echo "::endgroup::"
           exit 1
 
