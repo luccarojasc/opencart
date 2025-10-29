@@ -15,7 +15,7 @@ jobs:
       # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
-      # Admin defaults only used by the generated compose (if your repo has none)
+      # Admin defaults used only by the generated compose (if your repo has none)
       OPENCART_USERNAME: admin
       OPENCART_PASSWORD: admin123
       OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
@@ -24,13 +24,20 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # REQUIRED: login to Docker Hub so Bitnami images can be pulled reliably
-      - name: Login to Docker Hub
+      # -------- Docker Hub login (OPTIONAL) ----------
+      - name: Login to Docker Hub (optional)
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
         uses: docker/login-action@v3
         with:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Proceed without Docker Hub login (may be rate-limited)
+        if: ${{ !secrets.DOCKERHUB_USERNAME || !secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "::warning::Docker Hub credentials not configured. Pulls may be rate-limited by Docker Hub and can fail intermittently."
+      # ------------------------------------------------
 
       - name: Locate or create docker-compose file (uses Docker Hub Bitnami images)
         id: compose
@@ -93,7 +100,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WEB_SVC="opencart"  # name we used in the generated file
+          WEB_SVC="opencart"  # name in the generated file
           if ! docker compose -f "$COMPOSE_FILE" ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose -f "$COMPOSE_FILE" ps --services | head -n1)"
           fi
