@@ -13,67 +13,65 @@ jobs:
 
     steps:
       - name: Checkout repo
-      # -------------------
         uses: actions/checkout@v4
 
+      # Create docker-compose.yml only if the repo doesn't have one.
+      # NOTE: The closing marker DCYAML must begin at column 0 (no spaces).
       - name: Generate docker-compose.yml if missing (uses GHCR Bitnami image)
-      # ----------------------------------------------------------------------
         shell: bash
         run: |
           set -euo pipefail
           if [ ! -f docker-compose.yml ]; then
-            cat > docker-compose.yml <<'YAML'
-            services:
-              db:
-                image: mariadb:10.6
-                environment:
-                  MARIADB_ROOT_PASSWORD: root
-                  MARIADB_DATABASE: opencart
-                  MARIADB_USER: oc
-                  MARIADB_PASSWORD: ocpass
-                ports:
-                  - "3306:3306"
-                healthcheck:
-                  test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MARIADB_USER} -p$${MARIADB_PASSWORD} || exit 1"]
-                  interval: 10s
-                  timeout: 5s
-                  retries: 10
+          cat <<'DCYAML' > docker-compose.yml
+services:
+  db:
+    image: mariadb:10.6
+    environment:
+      MARIADB_ROOT_PASSWORD: root
+      MARIADB_DATABASE: opencart
+      MARIADB_USER: oc
+      MARIADB_PASSWORD: ocpass
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MARIADB_USER} -p$${MARIADB_PASSWORD} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-              opencart:
-                image: ghcr.io/bitnami/opencart:latest
-                environment:
-                  OPENCART_HOST: localhost
-                  OPENCART_USERNAME: admin
-                  OPENCART_PASSWORD: admin123
-                  OPENCART_EMAIL: admin@example.com
-                  MARIADB_HOST: db
-                  MARIADB_PORT_NUMBER: 3306
-                  MARIADB_DATABASE: opencart
-                  MARIADB_USER: oc
-                  MARIADB_PASSWORD: ocpass
-                  ALLOW_EMPTY_PASSWORD: "yes"
-                ports:
-                  - "8080:8080"
-                depends_on:
-                  - db
-            YAML
+  opencart:
+    image: ghcr.io/bitnami/opencart:latest
+    environment:
+      OPENCART_HOST: localhost
+      OPENCART_USERNAME: admin
+      OPENCART_PASSWORD: admin123
+      OPENCART_EMAIL: admin@example.com
+      MARIADB_HOST: db
+      MARIADB_PORT_NUMBER: 3306
+      MARIADB_DATABASE: opencart
+      MARIADB_USER: oc
+      MARIADB_PASSWORD: ocpass
+      ALLOW_EMPTY_PASSWORD: "yes"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - db
+          DCYAML
           fi
           echo "----- docker-compose.yml -----"
           sed -n '1,200p' docker-compose.yml
-          echo "--------------------------------"
+          echo "-----------------------------"
 
-      - name: Authenticate to GHCR (no-op for public images, avoids throttling)
-      # ---------------------------------------------------------------------
+      # Authenticate to GHCR (prevents throttling even for public images)
+      - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Start OpenCart (docker-compose)
-      # -------------------------------------
         run: |
           docker compose -f docker-compose.yml up -d --remove-orphans
           docker compose -f docker-compose.yml ps
 
       - name: Detect OpenCart URL
-      # -------------------------
         shell: bash
         run: |
           if curl -fsSI http://localhost:8080 >/dev/null; then
@@ -81,13 +79,11 @@ jobs:
           elif curl -fsSI http://localhost >/dev/null; then
             echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           else
-            # Fallback (most setups map 8080)
             echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
           fi
           echo "Resolved LOCAL_BASE_URL=$(grep LOCAL_BASE_URL \"$GITHUB_ENV\" | tail -n1 | cut -d= -f2-)"
 
       - name: Wait for OpenCart to be reachable
-      # --------------------------------------
         shell: bash
         run: |
           set -e
@@ -106,34 +102,28 @@ jobs:
           exit 1
 
       - name: Verify HTTP headers (sanity)
-      # ---------------------------------
         run: curl -LI "$LOCAL_BASE_URL" || true
 
       - name: Setup Node.js (for testRigor CLI)
-      # --------------------------------------
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install testRigor CLI
-      # ---------------------------
         run: npm i -g testrigor-cli
 
       - name: Verify CLI is installed
-      # -----------------------------
         run: |
           which testrigor || true
           testrigor --version || true
           npx -y testrigor-cli --version
 
       - name: Trigger testRigor suite against localhost
-      # -----------------------------------------------
         env:
           TESTRIGOR_CI_TOKEN: ${{ secrets.TESTRIGOR_CI_TOKEN }}
         run: |
           echo "Suite ID: $TESTRIGOR_SUITE_ID"
           echo "URL:      $LOCAL_BASE_URL"
-          # Use npx to ensure the correct CLI binary/version is used
           npx -y testrigor-cli test-suite run "$TESTRIGOR_SUITE_ID" \
             --token "$TESTRIGOR_CI_TOKEN" \
             --localhost --url "$LOCAL_BASE_URL" \
