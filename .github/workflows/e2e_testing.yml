@@ -10,12 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read   # allow GHCR pulls with GITHUB_TOKEN
 
     env:
       # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
-      # Expose Docker Hub secrets as env (can be empty)
+      # Optional Docker Hub creds (if you add them); we still prefer GHCR.
       DOCKERHUB_USER:  ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -28,7 +29,15 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ---------- Optional Docker Hub login (guarded by env, not secrets) ----------
+      # Always log in to GHCR so pulls from ghcr.io are authenticated.
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Optional: login to Docker Hub (if you’ve configured secrets).
       - name: Login to Docker Hub (optional)
         if: ${{ env.DOCKERHUB_USER != '' && env.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
@@ -39,11 +48,9 @@ jobs:
 
       - name: Proceed without Docker Hub login (may be rate-limited)
         if: ${{ env.DOCKERHUB_USER == '' || env.DOCKERHUB_TOKEN == '' }}
-        run: |
-          echo "::warning::Docker Hub credentials not configured. Pulls may be rate-limited and can fail intermittently."
-      # ---------------------------------------------------------------------------
+        run: echo "::notice::Skipping Docker Hub login. Images will be pulled from GHCR."
 
-      - name: Locate or create docker-compose file (uses Docker Hub Bitnami images)
+      - name: Locate or create docker-compose file (uses GHCR Bitnami images)
         id: compose
         shell: bash
         run: |
@@ -57,11 +64,11 @@ jobs:
             fi
           done
 
-          echo "No compose file found. Writing fallback compose.yaml (Docker Hub Bitnami images)…"
+          echo "No compose file found. Writing fallback compose.yaml (GHCR Bitnami images)…"
           cat > compose.yaml <<'YAML'
           services:
             mariadb:
-              image: docker.io/bitnami/mariadb:10.6
+              image: ghcr.io/bitnami/mariadb:10.6
               environment:
                 - MARIADB_ROOT_PASSWORD=root
                 - MARIADB_DATABASE=opencart
@@ -74,7 +81,7 @@ jobs:
                 retries: 20
 
             opencart:
-              image: docker.io/bitnami/opencart:latest
+              image: ghcr.io/bitnami/opencart:latest
               depends_on:
                 - mariadb
               environment:
