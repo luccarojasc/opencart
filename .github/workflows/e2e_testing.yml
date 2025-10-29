@@ -10,15 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read   # allow GHCR pulls with GITHUB_TOKEN
 
     env:
       # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
-
-      # Optional Docker Hub creds (if you add them); we still prefer GHCR.
-      DOCKERHUB_USER:  ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Admin defaults used only by the generated compose (if your repo has none)
       OPENCART_USERNAME: admin
@@ -29,28 +24,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Always log in to GHCR so pulls from ghcr.io are authenticated.
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Optional: login to Docker Hub (if you’ve configured secrets).
-      - name: Login to Docker Hub (optional)
-        if: ${{ env.DOCKERHUB_USER != '' && env.DOCKERHUB_TOKEN != '' }}
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ env.DOCKERHUB_USER }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
-
-      - name: Proceed without Docker Hub login (may be rate-limited)
-        if: ${{ env.DOCKERHUB_USER == '' || env.DOCKERHUB_TOKEN == '' }}
-        run: echo "::notice::Skipping Docker Hub login. Images will be pulled from GHCR."
-
-      - name: Locate or create docker-compose file (uses GHCR Bitnami images)
+      - name: Locate or create docker-compose file (uses Bitnami on ECR Public)
         id: compose
         shell: bash
         run: |
@@ -64,11 +38,11 @@ jobs:
             fi
           done
 
-          echo "No compose file found. Writing fallback compose.yaml (GHCR Bitnami images)…"
+          echo "No compose file found. Writing fallback compose.yaml (Bitnami on ECR Public)…"
           cat > compose.yaml <<'YAML'
           services:
             mariadb:
-              image: ghcr.io/bitnami/mariadb:10.6
+              image: public.ecr.aws/bitnami/mariadb:10.6
               environment:
                 - MARIADB_ROOT_PASSWORD=root
                 - MARIADB_DATABASE=opencart
@@ -78,10 +52,10 @@ jobs:
                 test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "opencart", "-popencart"]
                 interval: 5s
                 timeout: 5s
-                retries: 20
+                retries: 30
 
             opencart:
-              image: ghcr.io/bitnami/opencart:latest
+              image: public.ecr.aws/bitnami/opencart:latest
               depends_on:
                 - mariadb
               environment:
@@ -113,11 +87,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WEB_SVC="opencart"  # in the generated file
+          # Pick the web service (for the generated file it's 'opencart')
+          WEB_SVC="opencart"
           if ! docker compose -f "$COMPOSE_FILE" ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose -f "$COMPOSE_FILE" ps --services | head -n1)"
           fi
 
+          # Determine published port (80 or 8080)
           PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ]; then
             PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
