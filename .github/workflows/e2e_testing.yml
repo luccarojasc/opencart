@@ -13,7 +13,7 @@ jobs:
       # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
-      # OpenCart admin defaults (used by fallback compose content)
+      # Admin defaults (used only by the fallback compose we generate)
       OPENCART_USERNAME: admin
       OPENCART_PASSWORD: admin123
       OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
@@ -22,14 +22,22 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Find an existing compose file or create a fallback (GHCR Bitnami images)
+      # Optional: login to Docker Hub to avoid anonymous pull limits
+      - name: Login to Docker Hub (optional)
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Locate or create docker-compose file
         id: compose
         shell: bash
         run: |
           set -euo pipefail
 
-          # Try common compose filenames
+          # Try common compose filenames in repo root
           for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
             if [ -f "$f" ]; then
               echo "Found compose file: $f"
@@ -38,12 +46,11 @@ jobs:
             fi
           done
 
-          echo "No compose file found. Writing fallback compose.yaml (Bitnami via GHCR)…"
+          echo "No compose file found. Writing fallback compose.yaml (Docker Hub Bitnami images)…"
           cat > compose.yaml <<'YAML'
-          version: "3.9"
           services:
             mariadb:
-              image: ghcr.io/bitnami/mariadb:10.6
+              image: bitnami/mariadb:10.6
               environment:
                 - MARIADB_ROOT_PASSWORD=root
                 - MARIADB_DATABASE=opencart
@@ -56,7 +63,7 @@ jobs:
                 retries: 20
 
             opencart:
-              image: ghcr.io/bitnami/opencart:latest
+              image: bitnami/opencart:latest
               depends_on:
                 - mariadb
               environment:
@@ -70,7 +77,7 @@ jobs:
                 - MARIADB_USER=opencart
                 - MARIADB_PASSWORD=opencart
                 - ALLOW_EMPTY_PASSWORD=yes
-              # Bitnami exposes HTTP on 8080 by default
+              # Bitnami exposes HTTP on 8080
               ports:
                 - "8080:8080"
           YAML
@@ -89,15 +96,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          # Choose the web service name (if "apache" isn't present, take the first)
           WEB_SVC="apache"
           if ! docker compose -f "$COMPOSE_FILE" ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose -f "$COMPOSE_FILE" ps --services | head -n1)"
           fi
           echo "WEB_SVC=$WEB_SVC"
 
-          # Try to discover published port
           PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ]; then
             PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
