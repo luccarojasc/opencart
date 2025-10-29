@@ -9,82 +9,58 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     env:
+      # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
+
+      # OpenCart auto-install knobs (used by the php service in docker-compose)
+      OPENCART_USERNAME: admin
+      OPENCART_PASSWORD: admin123
+      OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
+      OPENCART_HTTP_SERVER: http://localhost/   # compose uses this to set store URL
+      DB_DRIVER: mysqli
+      DB_HOSTNAME: mysql
+      DB_USERNAME: opencart
+      DB_PASSWORD: opencart
+      DB_DATABASE: opencart
+      DB_PORT: "3306"
+      DB_PREFIX: oc_
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Generate docker-compose.yml if missing (uses GHCR Bitnami image)
+      - name: Start services (docker-compose)
+        run: |
+          docker compose -f docker-compose.yml up -d --build --remove-orphans --quiet-pull
+          docker compose ps
+
+      - name: Detect services and URL
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -f docker-compose.yml ]; then
-          cat <<'DCYAML' > docker-compose.yml
-services:
-  db:
-    image: mariadb:10.6
-    environment:
-      MARIADB_ROOT_PASSWORD: root
-      MARIADB_DATABASE: opencart
-      MARIADB_USER: oc
-      MARIADB_PASSWORD: ocpass
-    ports:
-      - "3306:3306"
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MARIADB_USER} -p$${MARIADB_PASSWORD} || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  opencart:
-    image: ghcr.io/bitnami/opencart:latest
-    environment:
-      OPENCART_HOST: localhost
-      OPENCART_USERNAME: admin
-      OPENCART_PASSWORD: admin123
-      OPENCART_EMAIL: admin@example.com
-      MARIADB_HOST: db
-      MARIADB_PORT_NUMBER: 3306
-      MARIADB_DATABASE: opencart
-      MARIADB_USER: oc
-      MARIADB_PASSWORD: ocpass
-      ALLOW_EMPTY_PASSWORD: "yes"
-    ports:
-      - "8080:8080"
-    depends_on:
-      - db
-          DCYAML
+          # Choose the web service (commonly 'apache')
+          WEB_SVC="apache"
+          if ! docker compose ps --services | grep -qx "$WEB_SVC"; then
+            WEB_SVC="$(docker compose ps --services | head -n1)"
           fi
-          echo "----- docker-compose.yml -----"
-          sed -n '1,200p' docker-compose.yml
-          echo "-----------------------------"
 
-      # Authenticate to GHCR so public pulls aren’t throttled
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Start OpenCart (docker-compose)
-        run: |
-          docker compose -f docker-compose.yml up -d --remove-orphans
-          docker compose -f docker-compose.yml ps
-
-      - name: Detect OpenCart URL
-        shell: bash
-        run: |
-          if curl -fsSI http://localhost:8080 >/dev/null; then
-            echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
-          elif curl -fsSI http://localhost >/dev/null; then
+          # Derive published HTTP port (80 or 8080)
+          PORT="$(docker compose port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
+          if [ -z "$PORT" ]; then
+            PORT="$(docker compose port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
+          fi
+          if [ -z "$PORT" ] || [ "$PORT" = "80" ]; then
             echo "LOCAL_BASE_URL=http://localhost" >> "$GITHUB_ENV"
           else
-            echo "LOCAL_BASE_URL=http://localhost:8080" >> "$GITHUB_ENV"
+            echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
-          echo "Resolved LOCAL_BASE_URL=$(grep LOCAL_BASE_URL \"$GITHUB_ENV\" | tail -n1 | cut -d= -f2-)"
+          echo "Resolved LOCAL_BASE_URL=$(cat $GITHUB_ENV | grep LOCAL_BASE_URL | cut -d= -f2-)"
 
       - name: Wait for OpenCart to be reachable
         shell: bash
         run: |
           set -e
+          # Allow auto-install in php container to finish; poll front page
           for i in {1..90}; do
             if curl -fsS -o /dev/null -L "$LOCAL_BASE_URL"; then
               echo "OpenCart is up at $LOCAL_BASE_URL"
@@ -93,10 +69,9 @@ services:
             echo "Waiting for OpenCart... ($i/90)"
             sleep 3
           done
-          echo "::group::Recent docker logs"
-          docker compose -f docker-compose.yml logs --no-color --tail=300 || true
+          echo "::group::Recent container logs"
+          docker compose logs --no-color --tail=200
           echo "::endgroup::"
-          echo "OpenCart failed to start in time" >&2
           exit 1
 
       - name: Verify HTTP headers (sanity)
@@ -108,13 +83,9 @@ services:
           node-version: '20'
 
       - name: Install testRigor CLI
-        run: npm i -g testrigor-cli
-
-      - name: Verify CLI is installed
         run: |
-          which testrigor || true
+          npm i -g testrigor-cli
           testrigor --version || true
-          npx -y testrigor-cli --version
 
       - name: Trigger testRigor suite against localhost
         env:
