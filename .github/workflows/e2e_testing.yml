@@ -9,11 +9,16 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
 
+    # allow the job to pull public packages from GHCR
+    permissions:
+      contents: read
+      packages: read
+
     env:
       # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
-      # (Optional) promote Docker Hub creds to env so we can safely use them in `if:`
+      # Promote these to env so we can use them in `if:` safely
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
 
@@ -26,7 +31,15 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Optional: login to Docker Hub to avoid anonymous pull limits
+      # Always login to GHCR so pulls from ghcr.io are never rate-limited
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Optional: login to Docker Hub (only if you set these two secrets)
       - name: Login to Docker Hub (optional)
         if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
@@ -40,7 +53,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           # Try common compose filenames in repo root
           for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
             if [ -f "$f" ]; then
@@ -50,11 +62,11 @@ jobs:
             fi
           done
 
-          echo "No compose file found. Writing fallback compose.yaml (Docker Hub Bitnami images)…"
+          echo "No compose file found. Writing fallback compose.yaml (GHCR Bitnami images)…"
           cat > compose.yaml <<'YAML'
           services:
             mariadb:
-              image: bitnami/mariadb:10.6
+              image: ghcr.io/bitnami/mariadb:10.6
               environment:
                 - MARIADB_ROOT_PASSWORD=root
                 - MARIADB_DATABASE=opencart
@@ -67,7 +79,7 @@ jobs:
                 retries: 20
 
             opencart:
-              image: bitnami/opencart:latest
+              image: ghcr.io/bitnami/opencart:latest
               depends_on:
                 - mariadb
               environment:
@@ -115,7 +127,6 @@ jobs:
           else
             echo "LOCAL_BASE_URL=http://localhost:$PORT" >> "$GITHUB_ENV"
           fi
-
           echo "Resolved LOCAL_BASE_URL=$(grep -E '^LOCAL_BASE_URL=' "$GITHUB_ENV" | tail -n1 | cut -d= -f2-)"
 
       - name: Wait for OpenCart to be reachable
