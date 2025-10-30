@@ -24,8 +24,17 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # If the repo doesn't already have a compose file, create a minimal one.
-      - name: Locate or create docker-compose file (uses Bitnami on ECR Public)
+      # OPTIONAL: login to Docker Hub if you add these secrets later.
+      - name: Login to Docker Hub (optional)
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # If the repo doesn't already have a compose file, create a minimal one (Docker Hub Bitnami images).
+      - name: Locate or create docker-compose file (uses Bitnami on Docker Hub)
         id: compose
         shell: bash
         run: |
@@ -38,11 +47,11 @@ jobs:
             fi
           done
 
-          echo "No compose file found. Writing fallback compose.yaml (Bitnami on ECR Public)…"
+          echo "No compose file found. Writing fallback compose.yaml (Bitnami on Docker Hub)…"
           cat > compose.yaml <<'YAML'
           services:
             mariadb:
-              image: public.ecr.aws/bitnami/mariadb:10.6
+              image: bitnami/mariadb:10.6
               environment:
                 - MARIADB_ROOT_PASSWORD=root
                 - MARIADB_DATABASE=opencart
@@ -55,7 +64,7 @@ jobs:
                 retries: 30
 
             opencart:
-              image: public.ecr.aws/bitnami/opencart:latest
+              image: bitnami/opencart:latest
               depends_on:
                 - mariadb
               environment:
@@ -87,13 +96,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Web service name is 'opencart' in the generated compose
           WEB_SVC="opencart"
           if ! docker compose -f "$COMPOSE_FILE" ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose -f "$COMPOSE_FILE" ps --services | head -n1)"
           fi
 
-          # Port discovery (80 or 8080)
           PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ]; then
             PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
@@ -125,7 +132,7 @@ jobs:
           echo "::endgroup::"
           exit 1
 
-      - name: Verify HTTP headers (sanity)  # checkbox wants curl -LI
+      - name: Verify HTTP headers (sanity)
         run: curl -LI "$LOCAL_BASE_URL" || true
 
       - name: Setup Node.js (for testRigor CLI)
