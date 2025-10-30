@@ -15,7 +15,7 @@ jobs:
       # testRigor
       TESTRIGOR_SUITE_ID: ${{ vars.TESTRIGOR_SUITE_ID }}
 
-      # Admin defaults used only by the generated compose (if your repo has none)
+      # Admin defaults used only by the generated compose (if the repo has none)
       OPENCART_USERNAME: admin
       OPENCART_PASSWORD: admin123
       OPENCART_ADMIN_EMAIL: testing+opencart@testrigor.com
@@ -24,12 +24,12 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # If the repo doesn't already have a compose file, create a minimal one.
       - name: Locate or create docker-compose file (uses Bitnami on ECR Public)
         id: compose
         shell: bash
         run: |
           set -euo pipefail
-          # Try common compose filenames in the repo
           for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
             if [ -f "$f" ]; then
               echo "Found compose file: $f"
@@ -87,13 +87,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Pick the web service (for the generated file it's 'opencart')
+          # Web service name is 'opencart' in the generated compose
           WEB_SVC="opencart"
           if ! docker compose -f "$COMPOSE_FILE" ps --services | grep -qx "$WEB_SVC"; then
             WEB_SVC="$(docker compose -f "$COMPOSE_FILE" ps --services | head -n1)"
           fi
 
-          # Determine published port (80 or 8080)
+          # Port discovery (80 or 8080)
           PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 80 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
           if [ -z "$PORT" ]; then
             PORT="$(docker compose -f "$COMPOSE_FILE" port "$WEB_SVC" 8080 2>/dev/null | awk -F: 'NF{print $NF}' | tail -n1 || true)"
@@ -107,7 +107,7 @@ jobs:
 
           echo "Resolved LOCAL_BASE_URL=$(grep -E '^LOCAL_BASE_URL=' \"$GITHUB_ENV\" | tail -n1 | cut -d= -f2-)"
 
-      - name: Wait for OpenCart to be reachable
+      - name: Wait for OpenCart to be reachable (prove localhost)
         shell: bash
         run: |
           set -e
@@ -125,7 +125,7 @@ jobs:
           echo "::endgroup::"
           exit 1
 
-      - name: Verify HTTP headers (sanity)
+      - name: Verify HTTP headers (sanity)  # checkbox wants curl -LI
         run: curl -LI "$LOCAL_BASE_URL" || true
 
       - name: Setup Node.js (for testRigor CLI)
